@@ -11,13 +11,13 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, event, select, update
+from sqlalchemy import create_engine, event, inspect, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from cryptobot.core.models import Bar
-from cryptobot.db.schema import AuditLog, BarRow, Base, EquityPoint, PositionRow, PulseEventRow, Setting, TradeRow
+from cryptobot.db.schema import OUTCOME_COLUMNS, AuditLog, BarRow, Base, EquityPoint, PositionRow, PulseDecisionRow, PulseEventRow, Setting, TradeRow
 
 
 class Store:
@@ -41,6 +41,30 @@ class Store:
                 cur.close()
 
         Base.metadata.create_all(self.engine)
+        self.migrated = self._migrate()
+
+    def _migrate(self) -> list[str]:
+        """Add columns that exist in the models but not in an older database file.
+
+        ``create_all`` creates missing tables only. Every added column is nullable
+        or has a default, so old rows stay valid."""
+        added: list[str] = []
+        insp = inspect(self.engine)
+        with self.engine.begin() as conn:
+            for table in Base.metadata.sorted_tables:
+                have = {c["name"] for c in insp.get_columns(table.name)}
+                for col in table.columns:
+                    if col.name in have:
+                        continue
+                    ctype = col.type.compile(dialect=self.engine.dialect)
+                    ddl = f'ALTER TABLE {table.name} ADD COLUMN "{col.name}" {ctype}'
+                    if col.default is not None and getattr(col.default, "arg", None) is not None and not callable(col.default.arg):
+                        v = col.default.arg
+                        lit = ("1" if v else "0") if isinstance(v, bool) else (repr(v) if isinstance(v, str) else str(v))
+                        ddl += f" DEFAULT {lit}"
+                    conn.execute(text(ddl))
+                    added.append(f"{table.name}.{col.name}")
+        return added
 
     # -- settings -----------------------------------------------------------
 
@@ -183,19 +207,69 @@ class Store:
             return int(row.id)
 
     def update_pulse_event(self, event_id: int, **fields: Any) -> None:
+        """Only outcome columns may change after a signal is recorded. Signal-time
+        values are immutable so later price data can never leak into them."""
+        bad = set(fields) - OUTCOME_COLUMNS
+        if bad:
+            raise ValueError(f"signal-time columns are immutable: {sorted(bad)}")
         with Session(self.engine) as s:
             s.execute(update(PulseEventRow).where(PulseEventRow.id == event_id).values(**fields))
             s.commit()
 
-    def load_pulse_events(self, limit: int = 500, resolved_only: bool = False, direction: str | None = None) -> list[dict[str, Any]]:
+    def pulse_event(self, event_id: int) -> dict[str, Any] | None:
         with Session(self.engine) as s:
-            q = select(PulseEventRow).order_by(PulseEventRow.ts_ms.desc()).limit(limit)
+            r = s.get(PulseEventRow, event_id)
+            return {c.name: getattr(r, c.name) for c in PulseEventRow.__table__.columns} if r else None
+
+    def load_pulse_events(self, limit: int = 500, resolved_only: bool = False, direction: str | None = None, *, symbol: str | None = None,
+                          regime: str | None = None, since_ms: int | None = None, pending_only: bool = False, ascending: bool = False) -> list[dict[str, Any]]:
+        with Session(self.engine) as s:
+            q = select(PulseEventRow).order_by(PulseEventRow.ts_ms.asc() if ascending else PulseEventRow.ts_ms.desc()).limit(limit)
             if resolved_only:
-                q = q.where(PulseEventRow.outcome != "pending")
+                q = q.where(PulseEventRow.outcome.not_in(("pending", "abandoned")))
+            if pending_only:
+                q = q.where(PulseEventRow.outcome == "pending")
             if direction:
                 q = q.where(PulseEventRow.direction == direction)
+            if symbol:
+                q = q.where(PulseEventRow.symbol == symbol)
+            if regime:
+                q = q.where(PulseEventRow.regime == regime)
+            if since_ms is not None:
+                q = q.where(PulseEventRow.ts_ms >= since_ms)
             rows = list(s.scalars(q))
         return [{c.name: getattr(r, c.name) for c in PulseEventRow.__table__.columns} for r in rows]
+
+    def count_pulse_events(self, resolved_only: bool = False) -> int:
+        with Session(self.engine) as s:
+            q = select(PulseEventRow.id)
+            if resolved_only:
+                q = q.where(PulseEventRow.outcome.not_in(("pending", "abandoned")))
+            return len(list(s.scalars(q)))
+
+    def insert_decision(self, **fields: Any) -> int:
+        with Session(self.engine) as s:
+            row = PulseDecisionRow(**fields)
+            s.add(row)
+            s.commit()
+            return int(row.id)
+
+    def update_decision(self, decision_id: int, **fields: Any) -> None:
+        with Session(self.engine) as s:
+            s.execute(update(PulseDecisionRow).where(PulseDecisionRow.id == decision_id).values(**fields))
+            s.commit()
+
+    def load_decisions(self, *, event_id: int | None = None, mode: str | None = None, accepted: bool | None = None, limit: int = 5000) -> list[dict[str, Any]]:
+        with Session(self.engine) as s:
+            q = select(PulseDecisionRow).order_by(PulseDecisionRow.ts_ms.desc()).limit(limit)
+            if event_id is not None:
+                q = q.where(PulseDecisionRow.event_id == event_id)
+            if mode:
+                q = q.where(PulseDecisionRow.mode == mode)
+            if accepted is not None:
+                q = q.where(PulseDecisionRow.accepted == accepted)
+            rows = list(s.scalars(q))
+        return [{c.name: getattr(r, c.name) for c in PulseDecisionRow.__table__.columns} for r in rows]
 
     # -- audit --------------------------------------------------------------
 

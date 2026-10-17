@@ -50,6 +50,8 @@ class BookEvent:
     ask_depth_near: float
     bid_depth_wide: float  # within 0.5% of mid
     ask_depth_wide: float
+    seq: int = 0  # exchange update id of the book this summary came from (0 = unknown)
+    synced: bool = True  # False when the local book is known to be out of sync (never trade on it)
 
     @property
     def mid(self) -> float:
@@ -59,6 +61,18 @@ class BookEvent:
     def spread_pct(self) -> float:
         m = self.mid
         return (self.best_ask - self.best_bid) / m * 100.0 if m else 0.0
+
+
+@dataclass(slots=True)
+class BookSyncEvent:
+    """Order-book synchronisation state for one symbol (snapshot, gap, resync, verified)."""
+
+    exchange: str
+    symbol: str
+    ts_ms: int
+    status: str  # snapshot | synced | gap | resync | unsynced | verified | mismatch | stopped
+    detail: str = ""
+    seq: int = 0
 
 
 @dataclass(slots=True)
@@ -75,7 +89,7 @@ class LogEvent:
     ts_ms: int
 
 
-Event = ConnectionEvent | TickEvent | BarsEvent | HeartbeatEvent | LogEvent
+Event = ConnectionEvent | TickEvent | BarsEvent | BookEvent | BookSyncEvent | HeartbeatEvent | LogEvent
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +201,12 @@ class EquityEvent:
 
 @dataclass(slots=True)
 class PulseSnapshot:
+    """One coin's live state. When ``valid`` is False the scores are meaningless
+    and the GUI shows INSUFFICIENT DATA with ``health_detail`` instead."""
+
     symbol: str
     ts_ms: int
-    state: str  # off | warming | idle | monitor | prepared | entered
+    state: str  # off | warming | excluded | idle | monitor | prepared | entered
     prs_long: float
     prs_short: float
     f: float
@@ -202,6 +219,46 @@ class PulseSnapshot:
     spread_pct: float
     vol_pct: float
     note: str = ""
+    valid: bool = True
+    health: str = "ok"
+    health_detail: str = ""
+    regime: str = "unknown"
+    scores_long: dict[str, float] = field(default_factory=dict)
+    scores_short: dict[str, float] = field(default_factory=dict)
+    assessment_long: dict[str, object] = field(default_factory=dict)  # costs, target/stop, EV, evidence
+    assessment_short: dict[str, object] = field(default_factory=dict)
+    bid: float = 0.0
+    ask: float = 0.0
+    trades_per_min: float = 0.0
+    book_seq: int = 0
+
+
+@dataclass(slots=True)
+class PulseModeStatus:
+    """One paper-trading configuration (Conservative / Balanced / Experimental)."""
+
+    key: str
+    label: str
+    budget: float
+    equity: float
+    cash: float
+    open_positions: int
+    realized_today: float
+    unrealized: float
+    open_risk_pct: float
+    trades: int
+    wins: int
+    losses: int
+    net_pnl: float
+    gross_profit: float
+    gross_loss: float
+    consecutive_losses: int
+    paused_until_ms: int
+    halted: bool
+    message: str = ""
+    positions: list[dict] = field(default_factory=list)
+    accepted: int = 0
+    rejected: int = 0
 
 
 @dataclass(slots=True)
@@ -224,6 +281,11 @@ class PulseStatusEvent:
     stop_pct: float = 0.0
     target_pct: float = 0.0
     cost_pct: float = 0.0
+    connected: bool = False
+    modes: list[PulseModeStatus] = field(default_factory=list)
+    memory: dict[str, object] = field(default_factory=dict)  # resolved counts, effective samples, evidence text
+    ml: dict[str, object] = field(default_factory=dict)
+    health_summary: str = ""
 
 
 @dataclass(slots=True)
@@ -233,11 +295,15 @@ class PulseEventRecord:
     symbol: str
     direction: str
     prs: float
-    status: str  # entered | rejected | research
+    status: str  # signal | research | "" (outcome update)
     reason: str
-    outcome: str  # pending | target | stop | expired
+    outcome: str  # pending | target | stop | expired | abandoned
     mfe_pct: float | None
     mae_pct: float | None
     similar_n: int
     similar_p: float
     ev_pct: float
+    regime: str = ""
+    net_pct: float | None = None
+    first_hit: str | None = None
+    decisions: dict[str, tuple[bool, str]] = field(default_factory=dict)  # mode -> (accepted, reason)

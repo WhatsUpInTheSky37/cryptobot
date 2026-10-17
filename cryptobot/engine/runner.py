@@ -180,6 +180,12 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
                 if holder["pulse"] is not None:
                     holder["pulse"].stop()
                     holder["pulse"] = None
+            elif kind == "pulse_train":
+                if holder["pulse"] is not None:
+                    note = holder["pulse"].train_now()
+                    evt_q.put(LogEvent("INFO", "pulse", f"ML: {note}", int(time.time() * 1000)))
+                else:
+                    evt_q.put(LogEvent("WARNING", "pulse", "Start Pulse before training the model.", int(time.time() * 1000)))
             elif kind == "set_limits":
                 if trader is not None:
                     trader.set_limits(RiskLimits.model_validate(cmd["limits"]))

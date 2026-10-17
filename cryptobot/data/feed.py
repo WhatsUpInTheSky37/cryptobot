@@ -18,7 +18,7 @@ import ccxt.pro as ccxtpro
 from cryptobot.core.bars import TIMEFRAME_LABELS, BarAggregator
 from cryptobot.core.events import (
     BarsEvent,
-    BookEvent,
+    BookSyncEvent,
     ConnectionEvent,
     Event,
     HeartbeatEvent,
@@ -27,6 +27,9 @@ from cryptobot.core.events import (
 )
 from cryptobot.core.models import Bar, Tick
 from cryptobot.data.backfill import fetch_history, plan_backfill
+from cryptobot.data.orderbook import WS_URLS, BinanceDepthStream, BookValidator, summarize_book
+
+__all__ = ["MarketFeed", "FeedFatal", "is_geo_block", "summarize_book"]
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +69,7 @@ class MarketFeed:
         heartbeat_s: float = 1.0,
         order_book: bool = True,
         book_interval_ms: int = 1000,
+        book_source: str = "auto",  # auto | native | ccxt
     ) -> None:
         self.exchange_id = exchange_id
         self.symbols = list(symbols)
@@ -79,6 +83,8 @@ class MarketFeed:
         self.heartbeat_s = heartbeat_s
         self.order_book = order_book
         self.book_interval_ms = book_interval_ms
+        self.book_source = book_source
+        self._validator = BookValidator()
         self._aggs: dict[str, dict[int, BarAggregator]] = {
             s: {tf: BarAggregator(s, tf) for tf in self.timeframes_s} for s in self.symbols
         }
@@ -207,8 +213,13 @@ class MarketFeed:
 
     async def _watch(self, ex, stop: asyncio.Event) -> None:
         tasks = [asyncio.create_task(self._watch_symbol(ex, s), name=f"watch:{s}") for s in self.symbols]
-        if self.order_book and getattr(ex, "has", {}).get("watchOrderBook"):
-            tasks += [asyncio.create_task(self._watch_book(ex, s), name=f"book:{s}") for s in self.symbols]
+        if self.order_book:
+            native = self.exchange_id in WS_URLS and self.book_source in ("auto", "native")
+            if native:
+                stream = BinanceDepthStream(ex, self.exchange_id, self.symbols, self._emit, book_interval_ms=self.book_interval_ms)
+                tasks.append(asyncio.create_task(stream.run(), name="depth-stream"))
+            elif getattr(ex, "has", {}).get("watchOrderBook"):
+                tasks += [asyncio.create_task(self._watch_book(ex, s), name=f"book:{s}") for s in self.symbols]
         tasks.append(asyncio.create_task(self._heartbeat(ex), name="heartbeat"))
         stopper = asyncio.create_task(stop.wait(), name="stop")
         try:
@@ -251,14 +262,26 @@ class MarketFeed:
                         self._publish(symbol, tf, changed)
 
     async def _watch_book(self, ex, symbol: str) -> None:
+        """Order book maintained by ccxt; we validate what we can see and resubscribe on persistent problems."""
         last = 0
+        announced = False
         while True:
             book = await ex.watch_order_book(symbol, 20)
             now = ex.milliseconds()
+            problem = self._validator.check(symbol, book)
+            if problem:
+                self._emit(BookSyncEvent(self.exchange_id, symbol, now, "unsynced", problem, int(book.get("nonce") or 0)))
+                announced = False
+                if self._validator.exhausted(symbol):
+                    raise RuntimeError(f"{symbol} order book from {self.exchange_id} is unreliable ({problem}); resubscribing")
+                continue
+            if not announced:
+                self._emit(BookSyncEvent(self.exchange_id, symbol, now, "synced", "ccxt order book", int(book.get("nonce") or 0)))
+                announced = True
             if now - last < self.book_interval_ms:
                 continue
             last = now
-            ev = summarize_book(self.exchange_id, symbol, now, book.get("bids") or [], book.get("asks") or [])
+            ev = summarize_book(self.exchange_id, symbol, now, book.get("bids") or [], book.get("asks") or [], seq=int(book.get("nonce") or 0))
             if ev is not None:
                 self._emit(ev)
 
@@ -299,26 +322,3 @@ class MarketFeed:
         except asyncio.TimeoutError:
             pass
 
-
-def summarize_book(exchange_id: str, symbol: str, ts_ms: int, bids, asks) -> BookEvent | None:
-    """Reduce a depth snapshot to best prices and quote-denominated depth near the mid."""
-    if not bids or not asks:
-        return None
-    bb, ba = float(bids[0][0]), float(asks[0][0])
-    if bb <= 0 or ba <= 0:
-        return None
-    mid = (bb + ba) / 2.0
-
-    def depth(levels, lo: float, hi: float) -> float:
-        total = 0.0
-        for lvl in levels:
-            px, amt = float(lvl[0]), float(lvl[1])
-            if lo <= px <= hi:
-                total += px * amt
-        return total
-
-    return BookEvent(
-        exchange_id, symbol, ts_ms, bb, ba,
-        depth(bids, mid * 0.999, mid), depth(asks, mid, mid * 1.001),
-        depth(bids, mid * 0.995, mid), depth(asks, mid, mid * 1.005),
-    )

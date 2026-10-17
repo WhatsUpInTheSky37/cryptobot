@@ -148,6 +148,9 @@ class EngineController(QObject):
     def pulse_stop(self) -> None:
         self._cmd(type="pulse_stop")
 
+    def pulse_train(self) -> None:
+        self._cmd(type="pulse_train")
+
     def shutdown(self) -> None:
         if self._bridge is not None:
             self._bridge.stop()
