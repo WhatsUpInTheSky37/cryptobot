@@ -464,6 +464,11 @@ class PulsePage(QWidget):
         split.addWidget(self.detail)
         split.setSizes([700, 500])
         lay.addWidget(split, 1)
+        self.mem_edge = QLabel("")
+        self.mem_edge.setObjectName("muted")
+        self.mem_edge.setWordWrap(True)
+        self.mem_edge.setToolTip("AUC per indicator over the resolved long signals shown: 0.5 is no information; above 0.5 means higher values went with hitting the target first.")
+        lay.addWidget(self.mem_edge)
         return w
 
     # ------------------------------------------------------------ commands
@@ -606,6 +611,12 @@ class PulsePage(QWidget):
             e["_decisions"] = " ".join(sorted(decs.get(e["id"], [])))
             self._insert_row(e, at_top=False)
         self.mem_count.setText(f"{len(rows)} signals shown")
+        edge = analysis.indicator_edge(rows)
+        if edge["resolved"]:
+            self.mem_edge.setText(f"Indicator edge over {edge['resolved']} resolved long signals ({edge['hits']} hit the target first): "
+                                  + ", ".join(f"{r['name']} {r['auc']:.2f}" for r in edge["rows"]) + (f" · {edge['note']}" if edge["note"] else ""))
+        else:
+            self.mem_edge.setText("Indicator edge: no resolved long signals yet.")
 
     def _show_event(self) -> None:
         items = self.events.selectedItems()

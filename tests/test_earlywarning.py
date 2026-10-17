@@ -8,11 +8,11 @@ from cryptobot.core.events import BookEvent, ConnectionEvent, EWStatusEvent, Hea
 from cryptobot.core.models import Tick
 from cryptobot.earlywarning import backtest, study
 from cryptobot.config import AppPaths
-from cryptobot.earlywarning.cli import ew_db_path, research
+from cryptobot.earlywarning.cli import ew_db_path, export_csv, research
 from cryptobot.earlywarning.config import COMPONENTS, EWConfig, SurgeConfig, SurgeThreshold
 from cryptobot.earlywarning.data import BinanceUSData, download_all
 from cryptobot.earlywarning.engine import EarlyWarningEngine
-from cryptobot.earlywarning.events import detect_events, executable_bid
+from cryptobot.earlywarning.events import detect_events, executable_bid, observed_spread_pct, tradeable
 from cryptobot.earlywarning.features import price_changes, window_features
 from cryptobot.earlywarning.paper import simulate_trade, slip_pct, summarize
 from cryptobot.earlywarning.report import build_report
@@ -21,7 +21,7 @@ from cryptobot.earlywarning.score import INSUFFICIENT, EASModel, components_from
 from cryptobot.earlywarning.states import classify
 from cryptobot.earlywarning.store import EWStore, klines_array
 from cryptobot.earlywarning.synth import synthetic_aggtrades, synthetic_klines
-from cryptobot.earlywarning.targets import NOT_RELIABLE, TargetEstimator, outcome_after, walk_forward_targets
+from cryptobot.earlywarning.targets import NOT_RELIABLE, TargetEstimator, outcome_after, threshold_sweep, walk_forward_targets
 
 T0 = 1_750_000_000_000
 
@@ -151,6 +151,81 @@ def test_demo_runs_never_mix_with_real_rows_and_a_real_run_purges_them(synth, tm
 
 
 # ---------------------------------------------------------------- events
+
+
+def test_surges_need_a_close_a_floor_of_volume_and_report_truncated_peaks():
+    # 3 days of flat 1.00 candles with 100 trades and 100 quote volume a minute, then two spikes
+    n = 3 * 1440
+    ts = T0 + np.arange(n) * 60_000
+    rows = [(int(t), 1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100, 50.0, 50.0) for t in ts]
+    k = klines_array(rows)
+    i = 1000  # a wick-only spike: high +8% but the close stays at 1.00
+    k["high"][i + 2] = 1.08
+    j = 2000  # a real surge: closes march up 2% a minute for 10 minutes on 20 trades and 5 quote volume each
+    for m in range(1, 11):
+        k["close"][j + m] = 1.0 + 0.02 * m
+        k["high"][j + m] = k["close"][j + m]
+        k["open"][j + m] = k["close"][j + m - 1]
+        k["low"][j + m] = k["open"][j + m]
+        k["trades"][j + m] = 20
+        k["quote_volume"][j + m] = 5.0
+    drift = 1.2 + 0.0001 * np.arange(n - j - 11)  # afterwards price keeps creeping up: no reversal inside the search window
+    for col in ("open", "high", "low", "close"):
+        k[col][j + 11:] = drift
+    cfg = SurgeConfig()
+    ev = detect_events(k, cfg)
+    assert [e["gain_pct"] > 15 for e in ev] == [True], "the wick-only spike is not a surge; the closing surge is"
+    e = ev[0]
+    assert e["trades"] >= 200 and e["quote_volume"] >= 50
+    assert e["peak_truncated"], "price never reversed inside the search window"
+    assert e["tradeable"] is False and tradeable(ev, cfg) == [], "5 quote volume a minute is a few prints, not a market"
+    assert tradeable(ev, SurgeConfig(tradeable_quote_volume=10, tradeable_min_trades=10)) == ev
+    wick = detect_events(k, SurgeConfig(confirm_on_close=False))
+    assert len(wick) == 2 and abs(wick[0]["gain_pct"] - 8.0) < 0.01, "without close confirmation the wick counts, as before"
+    # volatility-relative thresholds: a flat pair has no range, so +5% stays +5% (the surge is still found);
+    # a wild pair needs more than the fixed thresholds
+    assert len(detect_events(k, SurgeConfig(vol_multiple=4.0))) == 1
+    wild = k.copy()
+    wild["high"] = wild["close"] * 1.03
+    wild["low"] = wild["close"] * 0.97
+    assert len(detect_events(wild, SurgeConfig())) >= 1 and len(detect_events(wild, SurgeConfig(vol_multiple=4.0))) == 0
+
+
+def test_observed_spread_from_taker_prints_and_threshold_sweep(synth):
+    k, _s, tr, _rows = synth
+    sp = observed_spread_pct(tr)
+    assert sp is not None and 0 <= sp < 2
+    assert observed_spread_pct(tr[:10]) is None and observed_spread_pct(None) is None
+    cfg = EWConfig()
+    setups = []
+    for i in range(80):
+        t0 = int(k["ts"][200 + i * 100])
+        o = outcome_after(k, t0, 60, 3.0, 2.0, 0.1)
+        setups.append({"symbol": "POND/USD", "t0_ms": t0, "eas": 60 + (i % 8) * 5, "kind": "grid", "vec": [0.0] * len(COMPONENTS), "outcomes": {60: o}})
+    sw = threshold_sweep(setups, cfg, {"POND/USD": sp}, min_n=10)
+    assert sw["horizon_min"] == 60 and [r["threshold"] for r in sw["rows"]][:3] == [60.0, 65.0, 70.0]
+    assert sw["rows"][0]["n"] == 80 and all(sw["rows"][i]["n"] >= sw["rows"][i + 1]["n"] for i in range(len(sw["rows"]) - 1))
+    assert sw["best"] is not None and sw["best"]["n"] >= 10 and sw["best"]["mean_net_pct"] == max(r["mean_net_pct"] for r in sw["rows"] if r["n"] >= 10)
+
+
+def test_top_markets_rank_by_quote_volume_and_export_csv(synth, tmp_path):
+    k, _s, _tr, rows = synth
+    store = EWStore(tmp_path / "ew.db")
+    client = FakeBinanceUS(k, rows, symbols=("PONDUSD", "COMPUSD", "BTCUSD"))
+    client.fetch_tickers = lambda: {"POND/USD": {"quoteVolume": 5_000.0, "last": 1.0}, "COMP/USD": {"baseVolume": 100.0, "last": 50.0}, "MXC/USDT": {"quoteVolume": 9_000.0, "last": 1.0}}
+    data = BinanceUSData(client, store, sleep=lambda s: None)
+    assert data.top_markets(2) == ["MXC/USDT", "POND/USD"]  # BTC/USD has no ticker: skipped; COMP = 5,000 ties and sorts after POND
+    assert data.top_markets(5) == ["MXC/USDT", "POND/USD", "COMP/USD"]
+    cfg = EWConfig(days=12)
+    cfg.seed_symbols = ["POND/USD"]
+    research(store, cfg, demo=True, progress=lambda m: None)
+    files = export_csv(store, tmp_path / "out")
+    names = {f.name for f in files}
+    assert {"POND-USD-candles-1m.csv", "POND-USD-events.csv", "POND-USD-windows.csv"} <= names
+    head = (tmp_path / "out" / "POND-USD-events.csv").read_text().splitlines()
+    assert "tradeable" in head[0] and len(head) > 1
+    text = build_report(store, cfg, demo=True)
+    assert "EAS threshold sweep" in text and "Observed spread" in text and "tradeable" in text
 
 
 def test_detect_events_thresholds_merge_and_statistics(synth):

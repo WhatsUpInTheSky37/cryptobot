@@ -147,6 +147,34 @@ def walk_forward_targets(setups: list[dict[str, Any]], cfg: EWConfig, *, n_folds
     return report
 
 
+def threshold_sweep(setups: list[dict[str, Any]], cfg: EWConfig, spreads: dict[str, float | None] | None = None, *, horizon_min: int | None = None, step: float = 5.0, min_n: int = 30) -> dict[str, Any]:
+    """Pick the EAS threshold by expected value, not by eye: for each level from the setup EAS upward, the
+    independent setups at or above it, their hit rate, and the mean net return at the horizon after a
+    round trip's costs (the pair's observed spread where known). In-sample over all setups; the best
+    level needs ``min_n`` setups. Nothing here is a profit claim."""
+    h = horizon_min or max(cfg.horizons_min)
+    setups = _dedupe(setups, max(cfg.horizons_min))
+    rows = []
+    top = max((s["eas"] for s in setups), default=cfg.targets.setup_eas)
+    thr = cfg.targets.setup_eas
+    while thr <= min(100.0, top + 1e-9):
+        sub = [s for s in setups if s["eas"] >= thr and h in s["outcomes"]]
+        if not sub:
+            break
+        nets = []
+        for s in sub:
+            sp = (spreads or {}).get(s["symbol"])
+            sp = cfg.costs.spread_estimate_pct if sp is None else sp
+            rt = 2 * cfg.costs.fee_rate * 100 + sp + 2 * cfg.costs.base_slippage_pct
+            nets.append(s["outcomes"][h]["close_pct"] - rt)
+        rows.append({"threshold": thr, "n": len(sub), "hit_rate": float(np.mean([s["outcomes"][h]["hit"] for s in sub])), "mean_net_pct": float(np.mean(nets)), "median_net_pct": float(np.median(nets)),
+                     "share_positive": float(np.mean([x > 0 for x in nets])), "mean_mfe_pct": float(np.mean([s["outcomes"][h]["mfe_pct"] for s in sub]))})
+        thr += step
+    ok = [r for r in rows if r["n"] >= min_n]
+    best = max(ok, key=lambda r: r["mean_net_pct"]) if ok else None
+    return {"horizon_min": h, "rows": rows, "best": best, "min_n": min_n, "note": "in-sample: every setup, no hold-out; use it to choose where to look, not as a result"}
+
+
 class TargetEstimator:
     """Live use of a validated report: returns None where the report says the target is not reliable."""
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 — tuned from the first day of real data (paper only)
+
+What the first day showed: every Crypto Pulse trade on Binance.US lost (stops hit within seconds on thin alts whose spread was wider than the stop; expiries at a flat price; targets never reached because thirty similar setups from the same two hours looked like evidence), and the Early Warning research on the four seed coins was mostly noise on pairs too thin to trade. Changes:
+
+Crypto Pulse
+- The stop must sit at least `stop_spread_mult` (2) spreads below the fill; when that distance exceeds the maximum stop the trade is refused with `stop_inside_spread` instead of being stopped by the next print.
+- Similar setups must span at least `min_evidence_span_h` (24) hours of market time before they count as evidence.
+- Expected value uses the lower confidence bound of the probability (`conservative_p`), in every mode and in the recorded signal.
+- The Market page's slippage setting can raise Pulse's slippage assumption but no longer zero it.
+- The status line says when round-trip costs exceed the expected move on every coin (the case on a 1.2% fee tier), so "no trades" reads as the cost gate, not a fault.
+- Market Memory tab: an indicator-edge line (AUC per indicator over resolved long signals).
+
+Early Warning
+- Surges must close above a threshold (`confirm_on_close`); an event's start is the last low before the move; `peak_truncated` marks peaks at the end of the search window (shown as "60+").
+- Events carry the trades and quote volume of the surge itself and a `tradeable` flag (`tradeable_quote_volume` 2,000, `tradeable_min_trades` 20); the pattern study, lead times, targets and methods use tradeable events only (`study_tradeable_only`), while controls stay clear of every surge.
+- Optional volatility-relative thresholds (`vol_multiple`): each threshold is at least that multiple of the pair's trailing 60-minute range.
+- `universe_top` / `--top N` researches the N most traded Binance.US pairs instead of the seed coins.
+- Observed spread per pair from taker prints replaces the assumed spread in the method backtest and is shown in the report.
+- EAS threshold sweep by expected value (in-sample, labelled as such) in the report.
+- `python -m cryptobot.earlywarning export` and an Export CSV button write candles, events, feature windows, signals and paper trades.
+
 ## 0.4.1 — Early Warning research: demo data kept apart, thin pairs named
 
 - Demo runs now use their own database (`earlywarning-demo.db`, report `earlywarning-demo-report.md`). A demo run analyses only its synthetic markets, and a real run removes any synthetic rows an earlier demo left in `earlywarning.db`, so real and generated data can no longer be pooled in one report or feed the live scanner's targets.

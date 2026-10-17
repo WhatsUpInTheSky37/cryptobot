@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from cryptobot.earlywarning.config import EWConfig
+from cryptobot.earlywarning.events import tradeable
 from cryptobot.earlywarning.features import FEATURE_KEYS, window_features
 from cryptobot.earlywarning.score import EASModel, components_from_features
 from cryptobot.earlywarning.store import EWStore
@@ -56,7 +57,7 @@ LEAD_LOOKBACK_MIN = 60  # fixed window length used to ask "was the warning visib
 GRID_STEP_MIN = 15
 
 
-def build_windows(store: EWStore, symbol: str, k: np.ndarray, trades: np.ndarray | None, events: list[dict[str, Any]], cfg: EWConfig, *, grid_step_min: int = GRID_STEP_MIN) -> dict[str, int]:
+def build_windows(store: EWStore, symbol: str, k: np.ndarray, trades: np.ndarray | None, events: list[dict[str, Any]], cfg: EWConfig, *, grid_step_min: int = GRID_STEP_MIN, exclude_events: list[dict[str, Any]] | None = None) -> dict[str, int]:
     """Compute and store features for: every event at every lookback ("event"); fixed 60-minute windows
     ending N minutes before each event ("lead"); random non-surge periods ("control"); and a regular
     time grid over the whole history ("grid", what a live scanner would have seen). Returns counts."""
@@ -93,7 +94,8 @@ def build_windows(store: EWStore, symbol: str, k: np.ndarray, trades: np.ndarray
             t0 += grid_step_min * 60_000
     n_ctrl = max(20, cfg.control_windows_per_event * len(events))
     surge_after = max(th.minutes for th in cfg.surge.thresholds) + cfg.surge.post_peak_minutes
-    ctrl = control_times(k, events, n_ctrl, exclusion_before_min=max_lb, exclusion_after_min=surge_after, min_gap_min=max(60, max_lb // 4))
+    # controls stay clear of EVERY surge, tradeable or not, so "ordinary" never contains a thin-pair spike
+    ctrl = control_times(k, exclude_events or events, n_ctrl, exclusion_before_min=max_lb, exclusion_after_min=surge_after, min_gap_min=max(60, max_lb // 4))
     n_c = 0
     for t0 in ctrl:
         for lb in lookbacks:
@@ -178,7 +180,7 @@ def compare(store: EWStore, symbol: str, cfg: EWConfig) -> dict[str, Any]:
     # grid: what a live scanner would have flagged, and how often nothing followed
     grid = [r for r in rows if r["kind"] == "grid" and r["eas"] is not None]
     surge_after_min = max(th.minutes for th in cfg.surge.thresholds)
-    ev_starts = sorted(e["start_ms"] for e in store.events(symbol))
+    ev_starts = sorted(e["start_ms"] for e in tradeable(store.events(symbol), cfg.surge))
     def followed(t0: int) -> bool:
         i = np.searchsorted(ev_starts, t0)
         return i < len(ev_starts) and ev_starts[i] - t0 <= surge_after_min * 60_000

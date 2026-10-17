@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from cryptobot.backtest.metrics import max_drawdown
+from cryptobot.pulse.config import INDICATOR_NAMES, INDICATORS
 
 REASON_TEXT: dict[str, str] = {
     "insufficient_data": "Insufficient market data",
@@ -29,6 +30,7 @@ REASON_TEXT: dict[str, str] = {
     "ev_below_margin": "Expected value below margin",
     "rr_below_min": "Reward/risk after costs too low",
     "insufficient_evidence": "Insufficient historical evidence",
+    "stop_inside_spread": "Spread too wide for a stop",
     "ml_low_probability": "Model probability too low",
     "risk_rejected": "Risk manager rejected the order",
     "ok": "Accepted",
@@ -103,6 +105,33 @@ def rejected_analysis(decisions: list[dict[str, Any]], events_by_id: dict[int, d
             "sum_net_pct": sum(nets) if nets else 0.0,
         })
     return out
+
+
+def _auc(pos: list[float], neg: list[float]) -> float | None:
+    """Probability that a random positive outranks a random negative (ties count half)."""
+    if not pos or not neg:
+        return None
+    p, n = np.asarray(pos, dtype=float), np.asarray(neg, dtype=float)
+    wins = (p[:, None] > n[None, :]).sum() + 0.5 * (p[:, None] == n[None, :]).sum()
+    return float(wins / (len(p) * len(n)))
+
+
+def indicator_edge(events: list[dict[str, Any]], keys: tuple[str, ...] = INDICATORS, *, direction: str = "long") -> dict[str, Any]:
+    """Which indicators separated winners from losers in the resolved signals of one direction.
+
+    AUC per indicator: 0.5 = no information, above 0.5 = higher values went with a hit,
+    below 0.5 = higher values went with a stop or expiry. Wide intervals with few signals."""
+    res = [e for e in events if e.get("direction") == direction and e.get("outcome") in ("target", "stop", "expired")]
+    hit = [e for e in res if (e.get("first_hit") or e.get("outcome")) == "target"]
+    miss = [e for e in res if (e.get("first_hit") or e.get("outcome")) != "target"]
+    rows = []
+    for k in keys:
+        a = _auc([float(e.get(k) or 0.0) for e in hit], [float(e.get(k) or 0.0) for e in miss])
+        if a is not None:
+            rows.append({"indicator": k, "name": INDICATOR_NAMES.get(k, k), "auc": a, "n": len(res)})
+    rows.sort(key=lambda r: -abs(r["auc"] - 0.5))
+    return {"direction": direction, "resolved": len(res), "hits": len(hit), "rows": rows,
+            "note": "needs dozens of resolved signals across several days before any ranking means something" if len(res) < 50 else ""}
 
 
 def decision_summary(decisions: list[dict[str, Any]]) -> dict[str, dict[str, int]]:

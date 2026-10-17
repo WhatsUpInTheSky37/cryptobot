@@ -39,6 +39,7 @@ class EWStore:
         self.con.execute("PRAGMA journal_mode=WAL") if str(path) != ":memory:" else None
         self.con.execute("PRAGMA synchronous=NORMAL")
         self.con.executescript(SCHEMA)
+        self._migrate()
         self.con.commit()
 
     # -- settings / study ----------------------------------------------------
@@ -49,6 +50,14 @@ class EWStore:
 
     def set(self, key: str, value: Any) -> None:
         self.con.execute("INSERT OR REPLACE INTO ew_settings (key, value) VALUES (?, ?)", (key, json.dumps(value, default=float)))
+        self.con.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was created (SQLite has no IF NOT EXISTS for columns)."""
+        have = {r[1] for r in self.con.execute("PRAGMA table_info(ew_events)").fetchall()}
+        for col, decl in (("trades", "INTEGER"), ("tradeable", "INTEGER"), ("peak_truncated", "INTEGER")):
+            if col not in have:
+                self.con.execute(f"ALTER TABLE ew_events ADD COLUMN {col} {decl}")
         self.con.commit()
 
     def close(self) -> None:
@@ -139,8 +148,9 @@ class EWStore:
         self.con.execute("DELETE FROM ew_events WHERE symbol=?", (symbol,))
         for e in events:
             self.con.execute(
-                "INSERT INTO ew_events (symbol, start_ms, trigger_ms, peak_ms, pre_price, peak_price, peak_bid, gain_pct, minutes_to_peak, reversal_ms, minutes_to_reversal, max_decline_pct, quote_volume, thresholds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (symbol, e["start_ms"], e["trigger_ms"], e["peak_ms"], e["pre_price"], e["peak_price"], e.get("peak_bid"), e["gain_pct"], e["minutes_to_peak"], e.get("reversal_ms"), e.get("minutes_to_reversal"), e.get("max_decline_pct"), e.get("quote_volume"), json.dumps(e.get("thresholds", []))),
+                "INSERT INTO ew_events (symbol, start_ms, trigger_ms, peak_ms, pre_price, peak_price, peak_bid, gain_pct, minutes_to_peak, reversal_ms, minutes_to_reversal, max_decline_pct, quote_volume, thresholds, trades, tradeable, peak_truncated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (symbol, e["start_ms"], e["trigger_ms"], e["peak_ms"], e["pre_price"], e["peak_price"], e.get("peak_bid"), e["gain_pct"], e["minutes_to_peak"], e.get("reversal_ms"), e.get("minutes_to_reversal"), e.get("max_decline_pct"), e.get("quote_volume"), json.dumps(e.get("thresholds", [])),
+                 e.get("trades"), int(bool(e.get("tradeable", True))), int(bool(e.get("peak_truncated", False)))),
             )
         self.con.commit()
 
@@ -151,6 +161,8 @@ class EWStore:
         for r in cur.fetchall():
             d = dict(zip([c[0] for c in cur.description], r))
             d["thresholds"] = json.loads(d["thresholds"] or "[]")
+            d["tradeable"] = bool(d["tradeable"]) if d.get("tradeable") is not None else True
+            d["peak_truncated"] = bool(d.get("peak_truncated"))
             out.append(d)
         return out
 

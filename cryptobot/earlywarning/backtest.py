@@ -16,8 +16,15 @@ from cryptobot.earlywarning.store import EWStore
 from cryptobot.earlywarning.targets import _dedupe, collect_setups
 
 
-def run_methods(store: EWStore, symbols: list[str], cfg: EWConfig, *, lookback_min: int = 60) -> dict[str, Any]:
+def run_methods(store: EWStore, symbols: list[str], cfg: EWConfig, *, lookback_min: int = 60, spreads: dict[str, float | None] | None = None) -> dict[str, Any]:
+    """``spreads``: observed spread % per symbol (from taker prints); where known it replaces the assumed spread in fills and the cost gate."""
     data: dict[str, tuple[np.ndarray, np.ndarray | None]] = {}
+    cfg_for: dict[str, EWConfig] = {}
+    for sym, sp in (spreads or {}).items():
+        if sp is not None:
+            c = cfg.model_copy(deep=True)
+            c.costs.spread_estimate_pct = float(sp)
+            cfg_for[sym] = c
     setups: list[dict[str, Any]] = []
     for s in symbols:
         k = store.klines(s, "1m")
@@ -45,7 +52,7 @@ def run_methods(store: EWStore, symbols: list[str], cfg: EWConfig, *, lookback_m
                 for s in subset:
                     k, tr = data[s["symbol"]]
                     vol = float(np.mean((k["high"] - k["low"]) / np.maximum(k["close"], 1e-12) * 100)) if len(k) else None
-                    t = simulate_trade(k, tr, s["symbol"], s["t0_ms"], em, xm, cfg, target_pct=pct_target, vol_pct=vol, budget=cfg.risk.budget)
+                    t = simulate_trade(k, tr, s["symbol"], s["t0_ms"], em, xm, cfg_for.get(s["symbol"], cfg), target_pct=pct_target, vol_pct=vol, budget=cfg.risk.budget)
                     if t is not None:
                         trades.append(t)
                 res[name] = summarize(trades, cfg.risk.budget)

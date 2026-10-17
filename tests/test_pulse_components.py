@@ -246,3 +246,36 @@ def test_config_normalises_weights_and_keeps_open_risk_cap_consistent():
     assert sum(abs(v) for v in w.values()) == pytest.approx(1.0) and w["sx"] < 0
     assert c.risk.max_open_risk_pct >= 1.0
     assert all(m.budget == c.budget for m in c.modes)
+
+
+def test_indicator_edge_ranks_indicators_by_separation():
+    from cryptobot.pulse.analysis import indicator_edge
+
+    ev = []
+    for i in range(40):
+        hit = i % 2 == 0
+        ev.append({"direction": "long", "outcome": "target" if hit else "stop", "first_hit": "target" if hit else "stop",
+                   "f": 90 if hit else 40, "a": 50, "w": 50, "r": 50, "c": 50, "acc": 30 if hit else 80, "vpr": 50, "sx": 50, "vx": 50})
+    ev.append({"direction": "short", "outcome": "target", "f": 1})
+    ev.append({"direction": "long", "outcome": "pending", "f": 1})
+    edge = indicator_edge(ev)
+    assert edge["resolved"] == 40 and edge["hits"] == 20
+    by = {r["indicator"]: r["auc"] for r in edge["rows"]}
+    assert by["f"] == 1.0 and by["acc"] == 0.0 and by["a"] == 0.5
+    assert edge["rows"][0]["indicator"] in ("f", "acc") and edge["note"]
+    assert indicator_edge([])["resolved"] == 0
+
+
+def test_memory_requires_evidence_spanning_market_time():
+    from cryptobot.db.store import Store
+    from cryptobot.pulse.memory import MarketMemory, MemoryRow
+
+    store = Store(":memory:")
+    m = MarketMemory(store, k=10, min_n=5, min_span_ms=24 * 3_600_000)
+    vec = [90, 90, 90, 90, 90, 50, 50, 50, 50, 0.2, 0.01, 0.5]
+    for i in range(8):  # eight independent setups, all inside one afternoon
+        m.add(MemoryRow(f"C{i}/USD", 1_750_000_000_000 + i * 600_000, "long", "range", vec, True, False, 0.1, 60_000, 0.4))
+    est = m.estimate("long", dict(zip(("f", "a", "w", "r", "c", "acc", "vpr", "sx", "vx", "vol_pct", "spread_pct", "imbalance"), vec)))
+    assert not est.sufficient and "span only" in est.note and "need 24 h" in est.note
+    m.add(MemoryRow("C9/USD", 1_750_000_000_000 + 30 * 3_600_000, "long", "range", vec, True, False, 0.1, 60_000, 0.4))
+    assert m.estimate("long", dict(zip(("f", "a", "w", "r", "c", "acc", "vpr", "sx", "vx", "vol_pct", "spread_pct", "imbalance"), vec))).sufficient

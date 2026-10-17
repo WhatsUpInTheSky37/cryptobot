@@ -104,7 +104,8 @@ class PulseEngine:
         self.symbols = list(symbols)
         self.cfg = config
         if slippage_pct is not None:
-            self.cfg.costs.base_slippage_pct = float(slippage_pct)
+            # the Market page's slippage setting can raise the assumption, never zero it: a fill always costs something
+            self.cfg.costs.base_slippage_pct = max(float(slippage_pct), self.cfg.costs.base_slippage_pct)
         self.clock = clock
         self.timezone = timezone
         self.fallback_fee = fallback_fee
@@ -116,7 +117,7 @@ class PulseEngine:
             h.min_obs = config.min_obs
             h.obs_interval_s = config.obs_interval_s
             self.sym[s] = _SymState(SymbolFeatures(s, config.window_s, config.obs_interval_s, config.history_obs, config.min_obs), h)
-        self.memory = MarketMemory(store, config.k_similar, config.min_similar, config.prior_p, config.overlap_ms)
+        self.memory = MarketMemory(store, config.k_similar, config.min_similar, config.prior_p, config.overlap_ms, int(config.min_evidence_span_h * 3_600_000))
         self.tracker = OutcomeTracker(store, self._on_resolved)
         self.modes: dict[str, PaperTrader] = {
             m.key: PaperTrader(m, config, store, exchange_id, clock_ms=self._now_ms, timezone=timezone, fallback_fee=fallback_fee) for m in config.modes
@@ -342,10 +343,16 @@ class PulseEngine:
         costs = round_trip_costs(self._fee_rate(symbol), obs.spread_pct, notional, obs.bid_depth, obs.ask_depth, band_pct=c.impact_band_pct, base_slip_pct=c.base_slippage_pct)
         return target, stop, move, costs
 
+    def _p_for_ev(self, est: Estimate) -> float | None:
+        """The probability the expected value is computed from: the lower confidence bound when conservative."""
+        if not est.sufficient:
+            return None
+        return est.ci_low if self.cfg.conservative_p and est.ci_low is not None else est.p_target
+
     def _display_assessment(self, symbol: str, obs: Observation, sc: Scores, direction: str, regime: str) -> dict[str, Any]:
         est = self.memory.estimate(direction, self._vec(sc, obs), regime)
         target, stop, move, costs = self._reference_plan(symbol, obs, est)
-        a = assess(target, stop, costs, est.p_target if est.sufficient else None, min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
+        a = assess(target, stop, costs, self._p_for_ev(est), min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
         return {"prs": sc.prs, "target_pct": target, "stop_pct": stop, "expected_move_pct": move, "cost_pct": costs.total_pct, "fee_pct": costs.fee_pct, "spread_pct": costs.spread_pct,
                 "slippage_pct": costs.slippage_pct, "p_target": est.p_target, "ev_pct": a.ev_pct, "rr": a.rr_after_costs, "break_even_p": a.break_even_p, "verdict": a.verdict,
                 "reason": a.reason, "evidence": est.note, "n_effective": est.n_effective, "ci": (est.ci_low, est.ci_high)}
@@ -354,7 +361,7 @@ class PulseEngine:
         vec = self._vec(sc, obs)
         est = self.memory.estimate(direction, vec, st.regime.name)
         target, stop, move, costs = self._reference_plan(symbol, obs, est)
-        a = assess(target, stop, costs, est.p_target if est.sufficient else None, min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
+        a = assess(target, stop, costs, self._p_for_ev(est), min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
         status = "signal" if direction == "long" else "research"
         features = {"raw_long": obs.raw_long, "raw_short": obs.raw_short, "scores": sc.as_dict(), "vol60_quote": obs.vol60_quote, "bid": obs.bid, "ask": obs.ask}
         eid = self.store.insert_pulse_event(
@@ -501,6 +508,11 @@ class PulseEngine:
         rates = [st.health.trades_per_min(now) for st in self.sym.values() if st.health.last_trade_ms]
         if self.connected and rates and max(rates) < 2.0 and self.running:
             health_summary += " · this exchange is thin (under 2 trades/min on every coin): order-flow scores need activity; Pulse is paper-only, so pick Coinbase or Kraken on the Market page for liquid data"
+        priced = [st.assessment.get("long") for st in self.sym.values() if st.status.ok and st.assessment.get("long")]
+        if self.running and priced and all(a["cost_pct"] * self.cfg.min_target_cost_mult > a["target_pct"] for a in priced):
+            worst = max(a["cost_pct"] for a in priced)
+            health_summary += (f" · round-trip costs (up to {worst:.2f}%: fees twice, spread, slippage) exceed the expected {self.cfg.costs.hold_minutes_for_move:g}-minute move on every coin, "
+                               f"so no entry can pass the cost gate on {self.exchange_id} at this fee tier; that is the gate working, not a fault")
         mem = {"events": self.events_recorded, "pending": len(self.tracker.pending), "resolved": self.memory.resolved(), "resolved_long": self.memory.resolved("long"),
                "effective_long": self.memory.effective("long"), "hit_rate_long": self.memory.hit_rate("long"), "min_similar": self.cfg.min_similar}
         mlinfo = {"available": mlmod.HAVE_LGBM, "backend": "lightgbm" if mlmod.HAVE_LGBM else "logistic (numpy)", "usable": bool(self.model and self.model.usable), "note": self.ml_note,

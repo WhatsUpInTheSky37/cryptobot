@@ -226,6 +226,10 @@ class PaperTrader:
         target, stop = plan_exits(setup.obs.vol_pct, move, stop_vol_mult=self.cfg.stop_vol_mult, min_stop_pct=self.cfg.min_stop_pct, max_stop_pct=self.cfg.max_stop_pct,
                                   target_capture=self.cost_cfg.target_capture, max_target_pct=self.cost_cfg.max_target_pct, adaptive=self.cfg.adaptive,
                                   fixed_target=self.cfg.target_pct, fixed_stop=self.cfg.stop_pct)
+        floor = self.cfg.stop_spread_mult * setup.obs.spread_pct
+        if floor > self.cfg.max_stop_pct:
+            return self._rej("stop_inside_spread", f"a stop {self.cfg.stop_spread_mult:g} spreads away ({floor:.3f}%) would exceed the maximum stop {self.cfg.max_stop_pct:g}%: the spread is too wide to place a stop that the next print would not hit")
+        stop = max(stop, floor)
         notional = risk_usd / (stop / 100.0) if stop > 0 else 0.0
         notional = min(notional, self.mode.budget * self.risk_cfg.per_position_pct / 100.0, self.cash)
         fee_rate = self.cost_cfg.fee_rate_override if self.cost_cfg.fee_rate_override is not None else (info.taker_fee or self.fallback_fee)
@@ -235,7 +239,8 @@ class PaperTrader:
         if m.use_ml and ml_p is not None:
             p, p_src = ml_p, "ml"
         elif est.sufficient:
-            p, p_src = est.p_target, "memory"
+            # conservative: the lower confidence bound, so thin evidence cannot look like a sure thing
+            p, p_src = (est.ci_low if self.cfg.conservative_p and est.ci_low is not None else est.p_target), "memory"
         a = assess(target, stop, costs, p, min_ev_pct=m.min_ev_pct, min_rr=m.min_rr, min_target_cost_mult=self.cfg.min_target_cost_mult)
         if a.verdict != "ok":
             d = self._rej(a.verdict, a.reason if a.verdict != "insufficient_evidence" else est.note)

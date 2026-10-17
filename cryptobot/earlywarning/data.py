@@ -130,6 +130,32 @@ class BinanceUSData:
             out.append({"symbol": f"{s['baseAsset']}/{s['quoteAsset']}", "market_id": mid, "base": s["baseAsset"], "quote": s["quoteAsset"]})
         return out
 
+    def top_markets(self, n: int, quotes: tuple[str, ...] = ("USD", "USDT")) -> list[str]:
+        """The ``n`` TRADING spot pairs with the most 24h quote volume (one per base asset, the most traded quote wins).
+        Empty when the exchange returns no tickers."""
+        eligible = self.eligible_markets(quotes)
+        tickers = self.tickers()
+        ranked = []
+        for m in eligible:
+            t = tickers.get(m["symbol"]) or tickers.get(m["market_id"])
+            if not t:
+                continue
+            qv = t.get("quoteVolume")
+            last = float(t.get("last") or t.get("close") or 0.0)
+            if qv is None and t.get("baseVolume") is not None and last:
+                qv = float(t["baseVolume"]) * last
+            ranked.append((float(qv or 0.0), m["symbol"], m["base"]))
+        ranked.sort(reverse=True)
+        out, seen = [], set()
+        for _qv, sym, base in ranked:
+            if base in seen:
+                continue
+            seen.add(base)
+            out.append(sym)
+            if len(out) >= n:
+                break
+        return out
+
     # -- klines ------------------------------------------------------------------
 
     def fetch_klines(self, market_id: str, interval: str, start_ms: int, end_ms: int) -> list[tuple]:

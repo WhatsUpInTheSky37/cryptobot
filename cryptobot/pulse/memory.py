@@ -82,10 +82,11 @@ def row_from_event(e: dict) -> MemoryRow | None:
 
 
 class MarketMemory:
-    def __init__(self, store: Store, k: int = 50, min_n: int = 30, prior: float = 0.45, overlap_ms: int = 600_000) -> None:
+    def __init__(self, store: Store, k: int = 50, min_n: int = 30, prior: float = 0.45, overlap_ms: int = 600_000, min_span_ms: int = 0) -> None:
         self.store = store
         self.k = k
         self.min_n = min_n
+        self.min_span_ms = min_span_ms  # the picked evidence must cover at least this much market time
         self.prior = prior  # reference only: shown as "what we assumed", never used to accept a trade
         self.overlap_ms = overlap_ms
         self.rows: list[MemoryRow] = []
@@ -155,6 +156,10 @@ class MarketMemory:
         if n_eff < min_n:
             return Estimate(False, None, None, None, None, None, len(picked), n_eff, None, None, use_same,
                             f"{INSUFFICIENT}: {n_eff} independent similar setups, need {min_n}", [(r.symbol, r.ts_ms) for r in picked[:10]])
+        span = max(r.ts_ms for r in picked) - min(r.ts_ms for r in picked)
+        if span < self.min_span_ms:
+            return Estimate(False, None, None, None, None, None, len(picked), n_eff, None, None, use_same,
+                            f"{INSUFFICIENT}: the {n_eff} similar setups span only {span / 3_600_000:.1f} h of market history, need {self.min_span_ms / 3_600_000:g} h", [(r.symbol, r.ts_ms) for r in picked[:10]])
         # each cluster contributes one observation: its mean outcome
         hits = sum(sum(r.hit for r in c) / len(c) for c in clusters)
         stops = sum(sum(r.stopped for r in c) / len(c) for c in clusters)

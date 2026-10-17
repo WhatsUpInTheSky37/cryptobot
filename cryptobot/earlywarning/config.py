@@ -29,6 +29,11 @@ class SurgeConfig(BaseModel):
     reversal_retrace: float = 0.5  # the surge is over when price gives back this share of the gain
     post_peak_minutes: int = 120  # how far after the peak to look for the decline
     max_peak_search_minutes: int = 240
+    confirm_on_close: bool = True  # a candle must CLOSE above the threshold, not merely wick through it
+    vol_multiple: float = 0.0  # >0: each threshold becomes max(pct, vol_multiple x the trailing 60-minute range %), so a 4-cent coin and BTC are judged against their own noise
+    tradeable_quote_volume: float = 2_000.0  # an event is "tradeable" only when this much quote volume traded between its start and the threshold crossing ...
+    tradeable_min_trades: int = 20  # ... across at least this many trades; otherwise it was a few prints crossing a wide spread
+    study_tradeable_only: bool = True  # pattern study, lead times, targets and methods use tradeable events only
 
 
 class CostConfig(BaseModel):
@@ -102,6 +107,7 @@ class EWConfig(BaseModel):
     entry_method: str = "A"  # A early accumulation | B confirmed breakout | C breakout + retest
     control_windows_per_event: int = 5
     train_share: float = 0.6  # chronological split for out-of-sample comparisons
+    universe_top: int = 0  # >0: research the N most traded Binance.US spot pairs (by 24h quote volume) instead of the seed list
 
     def weights_normalized(self) -> dict[str, float]:
         tot = sum(abs(v) for v in self.score.weights.values()) or 1.0

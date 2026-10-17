@@ -22,12 +22,14 @@ def build_report(store: EWStore, cfg: EWConfig, *, demo: bool = False) -> str:
     targets = store.get_study("targets", {}) or {}
     methods = store.get_study("methods", {}) or {}
     run = store.get_study("run", {}) or {}
+    spreads = store.get_study("spread", {}) or {}
+    sweep = store.get_study("sweep", {}) or {}
     lines = ["# Early Warning — research report", ""]
     if demo or run.get("demo"):
         lines += ["> **SYNTHETIC DATA.** This report was produced from generated candles to exercise the pipeline. It says nothing about real markets.", ""]
     lines += [f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · exchange {run.get('exchange', 'binanceus')} · requested {run.get('days', cfg.days)} days · paper only.", ""]
     min_vol = cfg.scanner.min_quote_volume_24h
-    lines += ["## 1. Markets and data", "", "| Symbol | Binance.US id | Status | Available | 1m candles | Aggregated trades | Median daily volume | Note |", "|---|---|---|---|---|---|---|---|"]
+    lines += ["## 1. Markets and data", "", "| Symbol | Binance.US id | Status | Available | 1m candles | Aggregated trades | Median daily volume | Observed spread | Note |", "|---|---|---|---|---|---|---|---|---|"]
     dl = {(d["symbol"], d["kind"]): d for d in downloads}
     thin: list[str] = []
     for m in markets:
@@ -39,20 +41,28 @@ def build_report(store: EWStore, cfg: EWConfig, *, demo: bool = False) -> str:
         if med is not None and med < min_vol and m["available"]:
             thin.append(m["symbol"])
         vol = "—" if med is None else f"{med:,.0f} {m['quote']}" + (" (THIN)" if med < min_vol else "")
-        lines.append(f"| {m['symbol']} | {m['market_id']} | {m['status']} | {'yes' if m['available'] else 'NO'} | {span} | {tr['rows'] if tr else 'none'} | {vol} | {m['note'] or ''} |")
+        sp = spreads.get(m["symbol"])
+        lines.append(f"| {m['symbol']} | {m['market_id']} | {m['status']} | {'yes' if m['available'] else 'NO'} | {span} | {tr['rows'] if tr else 'none'} | {vol} | {_f(sp, '{:.3f}%')} | {m['note'] or ''} |")
     lines += ["", "Individual historical trades require an API key on Binance.US and were not used; aggregated trades carry the taker side. Historical order-book snapshots do not exist on the exchange, so bid prices are approximated by the last sell-taker print near each moment (or an assumed spread where no trade is available).", ""]
     if thin:
         lines += [f"**THIN MARKETS.** {', '.join(thin)} traded a median of less than {min_vol:,.0f} per day in this data, which is the live scanner's minimum. Surges on such a pair are often a handful of trades crossing a wide spread; the event and method statistics below describe them, but a paper position could not have been filled at those prices and the live scanner would not select the pair.", ""]
     lines += ["## 2. Surge events", ""]
+    sc = cfg.surge
+    lines += [f"A surge is tradeable when at least {sc.tradeable_quote_volume:,.0f} of quote volume traded between its start and the threshold crossing across at least {sc.tradeable_min_trades} trades; the other events are a few prints crossing a wide spread. "
+              + ("Patterns, lead times, targets and methods below are computed from tradeable events only." if sc.study_tradeable_only else "All events are used below.")
+              + (" Candles must close above a threshold; wicks do not count." if sc.confirm_on_close else "")
+              + (f" Thresholds are at least {sc.vol_multiple:g}x the pair's trailing 60-minute range." if sc.vol_multiple > 0 else "")
+              + " A minutes-to-peak value ending in + means price was still rising when the search window ended.", ""]
     for sym, r in per_coin.items():
         evs = store.events(sym)
-        lines.append(f"### {sym}: {len(evs)} events")
+        n_tr = sum(1 for e in evs if e.get("tradeable", True))
+        lines.append(f"### {sym}: {len(evs)} events, {n_tr} tradeable")
         if evs:
-            lines += ["", "| Start (UTC) | Pre price | Peak | Gain | Min to peak | Min to reversal | Max decline after peak | Quote volume | Thresholds |", "|---|---|---|---|---|---|---|---|---|"]
+            lines += ["", "| Start (UTC) | Pre price | Peak | Gain | Min to peak | Min to reversal | Max decline after peak | Surge volume | Surge trades | Tradeable | Thresholds |", "|---|---|---|---|---|---|---|---|---|---|---|"]
             for e in evs[:40]:
-                lines.append(f"| {datetime.fromtimestamp(e['start_ms'] / 1000, timezone.utc):%m-%d %H:%M} | {e['pre_price']:.6g} | {e['peak_price']:.6g} (bid ≈ {_f(e.get('peak_bid'), '{:.6g}')}) | {e['gain_pct']:+.1f}% | {e['minutes_to_peak']:.0f} | {_f(e.get('minutes_to_reversal'), '{:.0f}')} | {_f(e.get('max_decline_pct'), '{:+.1f}%')} | {_f(e.get('quote_volume'), '{:,.0f}')} | {', '.join(e['thresholds'])} |")
+                lines.append(f"| {datetime.fromtimestamp(e['start_ms'] / 1000, timezone.utc):%m-%d %H:%M} | {e['pre_price']:.6g} | {e['peak_price']:.6g} (bid ≈ {_f(e.get('peak_bid'), '{:.6g}')}) | {e['gain_pct']:+.1f}% | {e['minutes_to_peak']:.0f}{'+' if e.get('peak_truncated') else ''} | {_f(e.get('minutes_to_reversal'), '{:.0f}')} | {_f(e.get('max_decline_pct'), '{:+.1f}%')} | {_f(e.get('quote_volume'), '{:,.0f}')} | {_f(e.get('trades'), '{:,}')} | {'yes' if e.get('tradeable', True) else 'NO'} | {', '.join(e['thresholds'])} |")
             if len(evs) > 40:
-                lines.append(f"| … {len(evs) - 40} more | | | | | | | | |")
+                lines.append(f"| … {len(evs) - 40} more | | | | | | | | | | |")
         lines.append("")
     lines += ["## 3-4. Pre-surge patterns versus ordinary periods", ""]
     if pooled:
@@ -84,6 +94,14 @@ def build_report(store: EWStore, cfg: EWConfig, *, demo: bool = False) -> str:
         for h, v in targets.get("horizons", {}).items():
             lines.append(f"| {h} min | {v.get('n_oos', 0)} | {_f(v.get('oos_hit_rate'), '{:.0%}')} | {_f(v.get('brier_model'), '{:.3f}')} vs {_f(v.get('brier_base'), '{:.3f}')} | {'yes' if v.get('probability_validated') else 'no'} | {_f(v.get('target_gross_pct'), '{:+.2f}%')} | {_f(v.get('target_net_pct'), '{:+.2f}%')} | {_f(v.get('coverage'), '{:.0%}')} | {v.get('label')} |")
         lines.append("")
+    if sweep.get("rows"):
+        lines += [f"### EAS threshold sweep ({sweep.get('horizon_min')} min horizon, in-sample)", "",
+                  f"Net return = close {sweep.get('horizon_min')} minutes after the setup, entered at the next open, minus a round trip's costs (observed spread where known). {sweep.get('note', '')}", "",
+                  "| EAS ≥ | Setups | Hit rate (+{up}% before −{down}%) | Mean net | Median net | Share positive | Mean MFE |".format(up=f"{cfg.targets.up_pct:g}", down=f"{cfg.targets.down_pct:g}"), "|---|---|---|---|---|---|---|"]
+        for r in sweep["rows"]:
+            lines.append(f"| {r['threshold']:g} | {r['n']} | {r['hit_rate']:.0%} | {r['mean_net_pct']:+.3f}% | {r['median_net_pct']:+.3f}% | {r['share_positive']:.0%} | {r['mean_mfe_pct']:+.2f}% |")
+        b = sweep.get("best")
+        lines += ["", (f"Best level with at least {sweep.get('min_n')} setups: EAS ≥ {b['threshold']:g}, mean net {b['mean_net_pct']:+.3f}% per setup." + (" That is still a loss after costs: no level is worth trading on this data." if b["mean_net_pct"] <= 0 else " Positive in-sample; it must survive the out-of-sample sections to mean anything.")) if b else f"No level has {sweep.get('min_n')} setups; the sweep is not informative.", ""]
     lines += ["## 9-10. Entry and exit methods, out of sample", ""]
     if methods and methods.get("results"):
         lines += [f"{methods['n_setups']} setups: first {methods['n_train']} (chronological) for reference, last {methods['n_test']} held out. Fees {cfg.costs.fee_rate * 100:.2f}%/side, spread {cfg.costs.spread_estimate_pct:g}%, slippage {cfg.costs.base_slippage_pct:g}%/side plus volume impact, bid-side fills, stops filled at the worse of the level and the next open.", "",

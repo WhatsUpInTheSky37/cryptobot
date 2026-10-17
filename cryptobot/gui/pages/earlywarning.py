@@ -192,7 +192,7 @@ class EarlyWarningPage(QWidget):
         top.addWidget(self.ex_count)
         lay.addLayout(top)
         split = QSplitter(Qt.Orientation.Vertical)
-        self.ev_table = _table(["Start (local)", "Pre price", "Peak", "Peak bid ≈", "Gain", "Min to peak", "Min to reversal", "Decline after", "Volume", "Earliest warning", "Would enter (A)", "Hypothetical (A/partial)"])
+        self.ev_table = _table(["Start (local)", "Pre price", "Peak", "Peak bid ≈", "Gain", "Min to peak", "Min to reversal", "Decline after", "Volume", "Trades", "Tradeable", "Earliest warning", "Would enter (A)", "Hypothetical (A/partial)"])
         self.ev_table.itemSelectionChanged.connect(self._show_event)
         split.addWidget(self.ev_table)
         bottom = QWidget()
@@ -260,14 +260,27 @@ class EarlyWarningPage(QWidget):
         self.r_days.setSuffix(" days")
         top.addWidget(QLabel("History"))
         top.addWidget(self.r_days)
-        self.r_run = QPushButton("Run research on Binance.US (MXC, POND, FLUX, COMP)")
+        self.r_top = QSpinBox()
+        self.r_top.setRange(0, 60)
+        self.r_top.setValue(self.cfg.universe_top)
+        self.r_top.setSpecialValueText("seed coins (MXC, POND, FLUX, COMP)")
+        self.r_top.setPrefix("top ")
+        self.r_top.setSuffix(" pairs by volume")
+        self.r_top.setToolTip("0 researches the four seed coins. N > 0 researches the N most traded Binance.US spot pairs instead, which is where surges have enough volume to be tradeable.")
+        top.addWidget(QLabel("Universe"))
+        top.addWidget(self.r_top)
+        self.r_run = QPushButton("Run research on Binance.US")
         self.r_run.setToolTip("Downloads candles and aggregated trades (resumable), finds surges, studies pre-surge patterns against ordinary periods, validates targets and methods out of sample, and writes the report. Can take a while.")
         self.r_run.clicked.connect(lambda: self._run_research(False))
         self.r_demo = QPushButton("Run on synthetic demo data")
         self.r_demo.setToolTip("No network. Generated data to exercise the pipeline and the screens; says nothing about real markets.")
         self.r_demo.clicked.connect(lambda: self._run_research(True))
+        self.r_export = QPushButton("Export CSV")
+        self.r_export.setToolTip("Writes candles, events, feature windows, signals and paper trades of the data shown as CSV files next to the database.")
+        self.r_export.clicked.connect(self._export_csv)
         top.addWidget(self.r_run)
         top.addWidget(self.r_demo)
+        top.addWidget(self.r_export)
         top.addStretch(1)
         lay.addLayout(top)
         self.r_log = QPlainTextEdit()
@@ -292,9 +305,22 @@ class EarlyWarningPage(QWidget):
         self.ctrl.ew_stop()
         self.main_store.set_setting("earlywarning.running", False)
 
+    def _export_csv(self) -> None:
+        from cryptobot.earlywarning.cli import export_csv
+
+        path = self.view.path.with_name("earlywarning-export" + ("-demo" if self.view is not self.ew else ""))
+        try:
+            files = export_csv(self.view, path)
+            self.r_log.appendPlainText(f"exported {len(files)} CSV files to {path}")
+        except Exception as e:  # noqa: BLE001
+            self.r_log.appendPlainText(f"export failed: {e}")
+
     def _run_research(self, demo: bool) -> None:
         if self._runner is not None:
             return
+        self.cfg.universe_top = self.r_top.value()
+        self.cfg.days = self.r_days.value()
+        self.ew.set("config", self.cfg.model_dump())
         self.r_log.clear()
         self.r_run.setEnabled(False)
         self.r_demo.setEnabled(False)
@@ -422,11 +448,13 @@ class EarlyWarningPage(QWidget):
             e["_profile"] = prof
             hyp = self._hypothetical(sym, e)
             e["_hyp"] = hyp
-            rows.append([_ts(e["start_ms"]), f"{e['pre_price']:.6g}", f"{e['peak_price']:.6g}", f"{e['peak_bid']:.6g}" if e.get("peak_bid") else "—", f"{e['gain_pct']:+.1f}%", f"{e['minutes_to_peak']:.0f}",
+            rows.append([_ts(e["start_ms"]), f"{e['pre_price']:.6g}", f"{e['peak_price']:.6g}", f"{e['peak_bid']:.6g}" if e.get("peak_bid") else "—", f"{e['gain_pct']:+.1f}%", f"{e['minutes_to_peak']:.0f}" + ("+" if e.get("peak_truncated") else ""),
                          f"{e['minutes_to_reversal']:.0f}" if e.get("minutes_to_reversal") is not None else "—", _pct(e.get("max_decline_pct"), 1), f"{e.get('quote_volume') or 0:,.0f}",
+                         f"{e.get('trades') or 0:,}", "yes" if e.get("tradeable", True) else "NO (thin)",
                          f"{run} min before" if run else "not before the start", hyp["enter"], hyp["result"]])
         _fill(self.ev_table, rows)
-        self.ex_count.setText(f"{len(self._events)} events" + (" (SYNTHETIC demo data)" if self.view is not self.ew else ""))
+        n_tr = sum(1 for e in self._events if e.get("tradeable", True))
+        self.ex_count.setText(f"{len(self._events)} events, {n_tr} tradeable" + (" (SYNTHETIC demo data)" if self.view is not self.ew else ""))
 
     def _hypothetical(self, sym: str, e: dict[str, Any]) -> dict[str, str]:
         """Would entry method A have fired, and what would the partial-exit paper trade have done?"""

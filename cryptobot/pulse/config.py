@@ -114,11 +114,14 @@ class PulseConfig(BaseModel):
     stop_pct: float = 0.20
     max_hold_s: int = 1200
     max_spread_pct: float = 0.10
+    stop_spread_mult: float = 2.0  # the stop must sit at least this many spreads below the fill: a stop inside the spread is hit by the next print
     # evidence
     ev_margin_pct: float = 0.02
     prior_p: float = 0.45  # shown for reference only; never used to accept a trade
     min_similar: int = 30
     k_similar: int = 50
+    min_evidence_span_h: float = 24.0  # the similar setups must span at least this much market time: 30 setups from one afternoon are one afternoon
+    conservative_p: bool = True  # expected value uses the LOWER bound of the probability's confidence interval, not the point estimate
     overlap_ms: int = 600_000  # events on the same coin closer than this are one observation
     min_target_cost_mult: float = 1.2
     research_mode: bool = True  # record and track every setup (always on; kept for config compatibility)

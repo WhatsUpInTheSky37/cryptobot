@@ -77,3 +77,14 @@ Even then, live trading is a separate decision with its own gate (the main bot's
 - LightGBM is optional and not installed by default (`pip install lightgbm` to use it); the logistic fallback is used otherwise and is reported on screen.
 - Expected holding time and the adverse-excursion regressor are reported from the memory, not predicted by the model (the classifier predicts target-before-stop only).
 - The screener/coin list is still the Coins page; Pulse does not choose coins itself.
+
+## Tuning after the first real day (0.5.0)
+
+The first day on Binance.US produced eight paper trades, all losers: stops hit seconds after entry on thin alts (the stop sat inside the spread), expiries at a flat price, and targets never reached. Four rules changed:
+
+1. **Stops outside the spread.** The stop distance is at least `stop_spread_mult` (2) times the quoted spread. If that exceeds `max_stop_pct` the trade is refused (`stop_inside_spread`).
+2. **Evidence must span time.** The similar setups behind a probability must cover at least `min_evidence_span_h` (24) hours; thirty setups from one afternoon describe one afternoon.
+3. **Conservative probability.** Expected value and reward/risk use the lower bound of the Wilson interval (`conservative_p`), so a 90% hit rate from 30 setups is treated as roughly 75%.
+4. **Slippage never zero.** The Market page's slippage setting can only raise the assumption.
+
+The status line now also states when round-trip costs exceed the expected move on every coin (Coinbase at a 1.2% taker fee, for example): Pulse will not trade there, and that is the cost gate working. The Market Memory tab shows an indicator-edge line: the AUC of each indicator over resolved long signals, which is how weights should eventually be chosen, once there are dozens of resolved signals across several days.

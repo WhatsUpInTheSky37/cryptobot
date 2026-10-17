@@ -66,3 +66,12 @@ Run the research on your Mac and read the generated report for the real answers 
 - Individual trades require an API key; aggregated trades are used.
 - Thresholds, weights and limits are starting values.
 - Live scanning depends on ccxt.pro streams for Binance.US; the feed code is shared with the rest of the app and reconnects with backoff.
+
+## Tuning after the first real run (0.5.0)
+
+- **Tradeable events.** Each surge records the trades and quote volume between its start (the last low before the move) and the bar that crossed the threshold. Below `tradeable_quote_volume` (2,000) or `tradeable_min_trades` (20) the event is kept in the explorer but excluded from the study, because a +7% "surge" on 21 USDT is one order crossing a spread. Controls still avoid every surge.
+- **Close confirmation and volatility-relative thresholds.** `confirm_on_close` (on) ignores wicks. `vol_multiple` (off by default) makes every threshold at least that multiple of the trailing 60-minute range, so a 4-cent coin is judged against its own noise.
+- **Universe.** Set `universe_top` (Research tab: "top N pairs by volume", or `--top N`) to research the most traded Binance.US pairs instead of the four seed coins; that is where surges have volume behind them.
+- **Observed spread.** From aggregated trades, the gap between the last aggressive buy and the last aggressive sell inside each minute; its median replaces the assumed 0.2% in the method backtest and is listed per market.
+- **Threshold sweep.** The report lists, for EAS 60, 65, … , the setups above the level, their hit rate and mean net return at the longest horizon after costs; the best level with at least 30 setups is named. It is in-sample and says where to look, not what to trade.
+- **Export.** "Export CSV" (or `python -m cryptobot.earlywarning export`) writes every table next to the database for a spreadsheet or notebook.

@@ -528,3 +528,36 @@ def test_pulse_started_after_the_feed_connected_is_not_stuck_disconnected():
     st = statuses(events)[-1]
     assert st.connected and all(s.health != "disconnected" for s in st.snapshots)
     assert [s for s in st.snapshots if s.symbol == S][0].valid
+
+
+def test_stop_is_kept_outside_the_spread_or_the_trade_is_refused():
+    # the book in drive_pressure is 0.2 wide on 3000 (0.0067%); 40 spreads is 0.27%, wider than the fixed 0.2% stop
+    eng, ev, store, clock = make(cfg(stop_spread_mult=40.0))
+    seed_memory(eng, n=60, p_hit=0.9)
+    drive_neutral(eng, clock, 90)
+    drive_pressure(eng, clock, 60)
+    drive_pressure(eng, clock, 15, drift=0.05, k0=60)
+    pos = next(p for m in eng.modes.values() for p in m.positions.values())
+    assert pos.stop_pct == pytest.approx(40.0 * 0.2 / (pos.entry_px - 0.0) * 100, rel=0.2) and pos.stop_pct > 0.2
+    # 100 spreads would be 0.67%, beyond the 0.6% maximum stop: no trade, with the reason recorded
+    eng, ev, store, clock = make(cfg(stop_spread_mult=100.0))
+    seed_memory(eng, n=60, p_hit=0.9)
+    drive_neutral(eng, clock, 90)
+    drive_pressure(eng, clock, 60)
+    drive_pressure(eng, clock, 15, drift=0.05, k0=60)
+    assert all(S not in m.positions for m in eng.modes.values())  # (B's book is 2 wide on 80,000: 100 spreads is only 0.25%, so B may still trade)
+    assert "stop_inside_spread" in {d["code"] for d in store.load_decisions()}
+
+
+def test_conservative_probability_uses_the_lower_confidence_bound():
+    eng, ev, store, clock = make()
+    seed_memory(eng, n=60, p_hit=0.9)
+    drive_neutral(eng, clock, 90)
+    drive_pressure(eng, clock, 60)
+    drive_pressure(eng, clock, 15, drift=0.05, k0=60)
+    row = store.load_pulse_events(limit=1)[0]
+    taken = [d for d in store.load_decisions() if d["accepted"]]
+    assert taken and row["similar_p"] >= 0.85
+    # the EV recorded on the signal was computed from the lower bound, so it is below the point-estimate EV
+    point_ev = row["similar_p"] * row["target_pct"] - (1 - row["similar_p"]) * row["stop_pct"] - row["cost_pct"]
+    assert row["ci_low"] < row["similar_p"] and row["ev_pct"] < point_ev - 1e-9
