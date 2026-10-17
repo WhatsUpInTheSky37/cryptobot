@@ -19,7 +19,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      - run: ./scripts/build_mac.sh
+      - name: Build macOS app and dmg
+        run: |
+          set +e
+          ./scripts/build_mac.sh > build.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            tail -n 80 build.log | while IFS= read -r line; do echo "::error title=mac build::${line}"; done
+            exit $rc
+          fi
+          tail -n 5 build.log
       - uses: actions/upload-artifact@v4
         with: { name: CryptoBot-macOS, path: dist/CryptoBot.dmg }
   windows:
@@ -30,7 +39,21 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: choco install innosetup -y --no-progress
-      - run: .\scripts\build_windows.ps1
+      - name: Build Windows installer
         shell: pwsh
+        run: |
+          $failed = $false
+          try {
+            .\scripts\build_windows.ps1 2>&1 | Tee-Object -FilePath build.log | Out-Null
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          } catch {
+            $_ | Out-String | Out-File -Append build.log
+            $failed = $true
+          }
+          if ($failed) {
+            Get-Content build.log -Tail 80 | ForEach-Object { Write-Output "::error title=windows build::$_" }
+            exit 1
+          }
+          Get-Content build.log -Tail 5
       - uses: actions/upload-artifact@v4
         with: { name: CryptoBot-Windows, path: dist/CryptoBot-Setup-*.exe }

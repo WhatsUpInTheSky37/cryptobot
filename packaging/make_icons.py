@@ -1,10 +1,13 @@
 """Draw the app icon with Qt and write icon.png, icon.ico and (on macOS) icon.icns."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # CI runners have no display
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen
