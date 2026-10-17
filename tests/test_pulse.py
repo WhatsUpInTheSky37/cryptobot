@@ -193,7 +193,8 @@ def test_no_scores_without_data_and_insufficient_data_is_explicit():
     drive_neutral(eng, clock, 30)  # 6 observations < min_obs 12
     st = statuses(ev)[-1]
     snap = [s for s in st.snapshots if s.symbol == S][0]
-    assert not snap.valid and snap.health == "insufficient_data" and "observations" in snap.health_detail
+    assert not snap.valid and snap.health == "insufficient_data" and "observations" in snap.health_detail and "min to go" in snap.health_detail
+    assert eng.message.startswith("Connected to") and "Warming up" in eng.message
     assert not records(ev)
     drive_neutral(eng, clock, 60)
     snap = [s for s in statuses(ev)[-1].snapshots if s.symbol == S][0]

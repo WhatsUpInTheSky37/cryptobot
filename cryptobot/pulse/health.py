@@ -33,6 +33,7 @@ class SymbolHealth:
         self.book_seq = 0
         self.observations = 0
         self.min_obs = 0
+        self.obs_interval_s = 5
         self._trade_times: deque[int] = deque()
         self.inactive_until_ms = 0
         self.sync_detail = ""
@@ -99,5 +100,6 @@ class SymbolHealth:
             self.inactive_until_ms = now_ms + c.inactive_cooldown_s * 1000
             return HealthStatus("inactive", f"{tpm:.1f} trades/min below {c.min_trades_per_min:g}; excluded for {c.inactive_cooldown_s // 60} min")
         if self.observations < self.min_obs:
-            return HealthStatus("insufficient_data", f"{self.observations}/{self.min_obs} observations")
+            left = (self.min_obs - self.observations) * self.obs_interval_s
+            return HealthStatus("insufficient_data", f"warming up, {self.observations}/{self.min_obs} observations (about {max(1, round(left / 60))} min to go)")
         return HealthStatus("ok", "")

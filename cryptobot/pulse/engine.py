@@ -114,6 +114,7 @@ class PulseEngine:
         for s in self.symbols:
             h = SymbolHealth(config.health)
             h.min_obs = config.min_obs
+            h.obs_interval_s = config.obs_interval_s
             self.sym[s] = _SymState(SymbolFeatures(s, config.window_s, config.obs_interval_s, config.history_obs, config.min_obs), h)
         self.memory = MarketMemory(store, config.k_similar, config.min_similar, config.prior_p, config.overlap_ms)
         self.tracker = OutcomeTracker(store, self._on_resolved)
@@ -167,7 +168,9 @@ class PulseEngine:
                 st.health.set_connected(self.connected)
             if not self.running:
                 return
-            if not self.connected:
+            if self.connected:
+                self.message = f"Connected to {self.exchange_id}. Warming up: each coin needs {self.cfg.min_obs} observations (about {self.cfg.min_obs * self.cfg.obs_interval_s // 60} min) of healthy data before it is scored."
+            else:
                 self.message = f"Exchange connection {ev.status}: no signals until it is back."
                 for st in self.sym.values():
                     st.status = HealthStatus("disconnected", "exchange connection is down")

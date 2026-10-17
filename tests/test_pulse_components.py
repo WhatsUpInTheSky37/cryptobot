@@ -46,7 +46,7 @@ def test_health_states_in_order():
     h.on_sync("synced", "")
     h.on_book(T0 + 20_000, synced=True, seq=2)
     s = h.evaluate(T0 + 20_000)
-    assert s.status == "insufficient_data" and s.label == INSUFFICIENT and "0/10" in s.detail
+    assert s.status == "insufficient_data" and s.label == INSUFFICIENT and "0/10" in s.detail and "min to go" in s.detail
     h.observations = 10
     assert h.evaluate(T0 + 20_000).ok
     assert h.evaluate(T0 + 35_000).status == "stale_book"
