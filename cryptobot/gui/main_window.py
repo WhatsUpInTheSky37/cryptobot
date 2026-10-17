@@ -28,6 +28,7 @@ from cryptobot.gui.controller import EngineController
 from cryptobot.gui.pages.market import MarketPage
 from cryptobot.gui.pages.coins import CoinsPage
 from cryptobot.gui.pages.dashboard import DashboardPage
+from cryptobot.gui.pages.earlywarning import EarlyWarningPage
 from cryptobot.gui.pages.help import HelpPage
 from cryptobot.gui.pages.history import HistoryPage
 from cryptobot.gui.pages.placeholder import PlaceholderPage
@@ -45,6 +46,7 @@ PAGES = [
     ("Coins", "coins"),
     ("Strategy", "strategy"),
     ("Pulse", "pulse"),
+    ("Early\nWarning", "earlywarning"),
     ("Risk", "risk"),
     ("History", "history"),
     ("Settings", "settings"),
@@ -124,6 +126,7 @@ class MainWindow(QMainWindow):
         self.pages["coins"] = CoinsPage(ctrl, store)
         self.pages["strategy"] = StrategyPage(store)
         self.pages["pulse"] = PulsePage(ctrl, store)
+        self.pages["earlywarning"] = EarlyWarningPage(ctrl, store)
         self.pages["risk"] = RiskPage(ctrl, store)
         self.pages["history"] = HistoryPage(ctrl, store)
         self.pages["settings"] = SettingsPage(ctrl, store, self._run_wizard)

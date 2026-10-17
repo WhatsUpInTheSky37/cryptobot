@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 — Early Warning: accumulation & surge detection (paper only)
+
+A new, independent module and navigation item. See `docs/early-warning.md`.
+
+- `earlywarning/data.py`: Binance.US exchangeInfo verification (exact symbols only), resumable 1m/5m candle and aggregated-trade downloads with rate-limit backoff, cached in a separate `earlywarning.db`.
+- `earlywarning/events.py`: configurable surge thresholds, merged windows, start/peak/reversal/decline/volume and executable-bid estimates.
+- `earlywarning/features.py`, `study.py`: pre-surge windows (24h … 1m), control windows, a 15-minute grid, per-feature AUC, threshold true/false-positive rates, grid precision/recall/missed surges, lead-time profiles.
+- `earlywarning/score.py`, `states.py`: Early Accumulation Score with INSUFFICIENT DATA semantics; eight market states with recorded transitions.
+- `earlywarning/targets.py`: Model A (probability) and Model B (MFE quantile) with chronological walk-forward, embargo, overlap merging; TARGET NOT YET RELIABLE and "validated but not tradeable" labels.
+- `earlywarning/paper.py`, `backtest.py`: entries A/B/C, seven exit methods including 50/25/25 partials, bid-side fills, no guaranteed stops, target-must-cover-costs gate, out-of-sample method comparison.
+- `earlywarning/scanner.py`, `engine.py`: market-wide screening, detailed streams for the top candidates, live EAS/state, signal bookkeeping (true/false positives, missed surges), independent paper book with circuit breakers.
+- `earlywarning/cli.py`: `python -m cryptobot.earlywarning research [--days N] [--demo] [--no-trades]` writes the report.
+- Screen: Live candidates, Event explorer with timeline, Paper trading, Research.
+- Nothing else changed: Crypto Pulse, the TEST/BUY trader, credentials and limits are untouched.
+
 ## 0.3.0 — Crypto Pulse: adaptive, evidence-driven paper engine
 
 Crypto Pulse stays **paper only**. Nothing in this release touches API credentials, the TEST/BUY trader, leverage, margin or futures. Binance.US remains the default exchange for Pulse; Kraken and Coinbase keep working.

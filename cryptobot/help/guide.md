@@ -72,6 +72,18 @@ A separate, paper-only research engine for the "Liquidity Pressure Divergence" i
 - **Machine learning** (Experimental mode) trains only once there are hundreds of resolved signals, is validated on later data it never saw, and is kept only if it beats the plain rules there. The Live tab shows whether a model is in use.
 - Spot accounts cannot short, so bearish setups are recorded (as "research") but never traded.
 
+# Early Warning
+
+A separate, paper-only research module that looks for unusual accumulation before a price surge, rather than chasing coins that already moved.
+
+- **Research first.** The Research tab downloads Binance.US candles and aggregated trades for the chosen coins (MXC, POND, FLUX, COMP by default; a symbol that is not listed is reported, never swapped for a look-alike), finds historical surges (+5% in 5 min, +10% in 15, +15% in 30, +20% in 60; configurable), reconstructs the buying in the hours and minutes before each one, and compares it with random ordinary periods. The report says which patterns separated the two, how often the same pattern showed up with no surge afterwards, and how early a warning would have been visible. Run it on a machine with internet access; it is resumable.
+- **Early Accumulation Score (EAS).** Six components (relative volume, aggressive buying imbalance, trade-frequency acceleration, price compression, liquidity absorption, persistence) ranked against the coin's own history. INSUFFICIENT DATA until there is enough valid history; never a neutral placeholder.
+- **States** are model labels: QUIET, POSSIBLE ACCUMULATION, ACCUMULATION CONFIRMED, BREAKOUT DEVELOPING, SURGE ACTIVE, POSSIBLE DISTRIBUTION, REVERSAL WARNING, NO DATA.
+- **Targets** come from validated history only: a low quantile of how far past setups actually moved, minus costs, checked on later data. Until that passes you see TARGET NOT YET RELIABLE and the paper book does not trade.
+- **Scanner.** Every eligible Binance.US spot market is screened from 24-hour tickers; the strongest few get live streams. Thin, wide-spread, stale or restricted markets are excluded.
+- **Paper book.** Entries only with valid data, a positive validated net target, enough liquidity and spread, and within the risk limits (0.5% per trade, 2% daily loss, 3 positions, pause after 4 losses). Exits default to 50% at the first target, 25% at the second, 25% trailing; stops are never assumed to fill at their level.
+- **Event explorer** shows each historical surge, the buying before it, the earliest warning, whether the strategy would have entered and a realistic hypothetical outcome, with a timeline.
+
 # Risk & Budget
 
 These limits apply identically in TEST and BUY and cannot be bypassed by any strategy.

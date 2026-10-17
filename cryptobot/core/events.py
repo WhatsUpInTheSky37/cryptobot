@@ -307,3 +307,45 @@ class PulseEventRecord:
     net_pct: float | None = None
     first_hit: str | None = None
     decisions: dict[str, tuple[bool, str]] = field(default_factory=dict)  # mode -> (accepted, reason)
+
+
+# ---------------------------------------------------------------------------
+# Early Warning (accumulation & surge research, paper only)
+
+
+@dataclass(slots=True)
+class EWCandidateView:
+    symbol: str
+    state: str  # one of earlywarning.config.STATES
+    eas: float | None
+    components: dict[str, object]  # ranks per component, or {'status': 'INSUFFICIENT DATA', 'detail': ...}
+    data_status: str  # "ok" or the reason data is not usable
+    price: float
+    changes: dict[int, float | None]  # % over 5/15/30/60 minutes
+    rel_volume: float | None
+    buy_sell_ratio: float | None
+    freq_accel: float | None
+    similarity: dict[str, object]  # {'n': ..., 'p': ... or None, 'note': ...}
+    surge_probability: float | None  # only when Model A is validated
+    target_label: str
+    target_net_pct: float | None  # only when Model B is validated and positive after costs
+    est_net_pct: float | None
+    warnings: list[str]
+    spread_pct: float | None
+    quote_volume_1m: float | None
+    scanner_reasons: list[str]
+    updated_ms: int = 0
+    note: str = ""
+
+
+@dataclass(slots=True)
+class EWStatusEvent:
+    running: bool
+    connected: bool
+    message: str
+    scanner: dict[str, object] = field(default_factory=dict)
+    candidates: list[EWCandidateView] = field(default_factory=list)
+    paper: dict[str, object] = field(default_factory=dict)
+    stats: dict[str, object] = field(default_factory=dict)  # true/false positives, missed surges, precision, recall
+    research: dict[str, object] = field(default_factory=dict)
+    transitions: list[dict] = field(default_factory=list)

@@ -3,7 +3,7 @@
 Budget-capped automated crypto trading desktop app with TEST and BUY modes.
 See [PLAN.md](PLAN.md) for the architecture, strategy analysis, wireframes and milestones.
 
-**Status: 0.3.0 — Milestone 6 done; Crypto Pulse rebuilt (see CHANGELOG.md).** BUY mode is locked until 14 days of TEST mode have passed. The bot trades in TEST mode only: live prices, simulated orders, no real money. BUY mode is locked until Milestone 5.
+**Status: 0.4.0 — Milestone 6 done; Crypto Pulse rebuilt; Early Warning added (see CHANGELOG.md).** BUY mode is locked until 14 days of TEST mode have passed. The bot trades in TEST mode only: live prices, simulated orders, no real money. BUY mode is locked until Milestone 5.
 
 ## What works now
 - Dark-themed desktop app with navigation, always-visible mode badge (STOPPED / TEST / BUY), clock and connection status.
@@ -18,6 +18,7 @@ See [PLAN.md](PLAN.md) for the architecture, strategy analysis, wireframes and m
 - Settings: API key add/remove, desktop pop-ups, Discord webhook and Telegram alerts (secrets in keychain), keep running in the system tray, start with the computer, engine log.
 - Closing the window keeps the bot trading in the tray; Quit from the tray icon stops it.
 - Crypto Pulse (paper only): the Liquidity Pressure Divergence research engine, rebuilt in 0.3 as an adaptive, evidence-driven paper engine. Every coin passes a data-health check first (connection, fresh trades, a synchronised and fresh order book, market activity, enough history) or shows INSUFFICIENT DATA and produces nothing. Nine order-flow indicators (pressure, absorption, liquidity withdrawal, replenishment weakening, cross-market confirmation, order-flow acceleration, volume-adjusted price response, spread expansion, volatility change) are ranked against each coin's own recent history, bullish and bearish separately, and combined into the Pressure Release Score; the market regime is classified from 1-minute bars. Every setup is recorded in the Market Memory with the full cost breakdown (fees, spread, depth-aware slippage) and followed for 20 minutes with returns at 30 s / 1 / 2 / 5 / 10 / 20 min, best and worst excursion, which of stop or target hit first, and the hypothetical net return after costs. Three independent paper books (Conservative, Balanced, Experimental) judge each signal against similar past setups (independent observations only, with confidence intervals) and trade only with a positive expected value and reward/risk after costs; otherwise the reason is recorded and shown in "Why didn't we trade?". Optional walk-forward-validated machine learning for the Experimental mode. Binance/Binance.US order books are maintained locally from the diff stream with sequence checks and automatic resync. Long-only on spot. See `docs/pulse-market-memory.md`.
+- Early Warning (paper only, 0.4): an independent accumulation-and-surge research module with its own database. Verifies Binance.US symbols, downloads candles and aggregated trades, finds historical surges, reconstructs the buying before them, compares it with ordinary periods (false-positive rates, lead times), scores live markets (Early Accumulation Score, INSUFFICIENT DATA when not valid), classifies market states, validates conservative targets walk-forward, compares entry/exit methods out of sample, screens the whole exchange and streams the strongest candidates, and paper-trades with strict gates. `python -m cryptobot.earlywarning research` writes the report. See `docs/early-warning.md`.
 - Built-in Help: a plain-English guide for every screen, every strategy, reading a backtest, limits, API keys and troubleshooting (Help menu or the Help page).
 - Reports: daily / weekly / monthly summaries with a P&L chart.
 - Dashboard: START / STOP / EMERGENCY STOP, the TEST | BUY toggle (BUY locked), budget gauge (allocated / in use / available / today's P&L / equity / drawdown), open positions with stops, equity curve, trade and signal feed. Halts itself at the daily-loss or drawdown limit and shows an alert with Resume.
@@ -54,6 +55,7 @@ cryptobot/
   secrets.py        OS keychain access (keyring); autostart.py login item; notify.py Discord/Telegram
   db/               SQLAlchemy schema + Store (SQLite, WAL)
   engine/           engine process entry, risk manager (the choke point), ledger, executors, trader loop
+  earlywarning/     Early Warning: data, events, features, study, score, states, targets, paper, backtest, scanner, engine, cli, report
   pulse/            Crypto Pulse: health, features, regime, costs, memory, outcomes, paper modes, analysis, ml, engine
   gui/              theme, controller (process bridge), main window, pages, widgets
 tests/              pytest + hypothesis
