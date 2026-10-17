@@ -227,6 +227,9 @@ class PulsePage(QWidget):
         self.mode_cards: dict[str, _ModeCard] = {}
         self._events_by_row: dict[int, int] = {}
         raw = store.get_setting("pulse.config") or {}
+        h = raw.get("health") or {}
+        if h.get("stale_trade_s") == 90 and h.get("min_trades_per_min") == 2.0:
+            raw.pop("health", None)  # 0.4.0 saved the old liquid-exchange defaults; let the thin-exchange defaults apply
         try:
             self.cfg = PulseConfig.model_validate(raw)
         except Exception:  # noqa: BLE001

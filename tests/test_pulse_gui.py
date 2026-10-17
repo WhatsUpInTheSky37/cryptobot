@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from cryptobot.core.events import PulseEventRecord, PulseModeStatus, PulseSnapshot, PulseStatusEvent  # noqa: E402
 from cryptobot.db.store import Store  # noqa: E402
 from cryptobot.gui.pages.pulse import PulsePage  # noqa: E402
+from cryptobot.pulse.config import PulseConfig  # noqa: E402
 from cryptobot.pulse.health import INSUFFICIENT  # noqa: E402
 
 
@@ -46,6 +47,19 @@ def mode(key, label, **kw):
                 accepted=1, rejected=4)
     base.update(kw)
     return PulseModeStatus(**base)
+
+
+def test_pulse_page_upgrades_old_health_defaults(app):
+    store = Store(":memory:")
+    old = PulseConfig().model_dump()
+    old["health"].update({"stale_trade_s": 90, "min_trades_per_min": 2.0})
+    store.set_setting("pulse.config", old)
+    page = PulsePage(FakeCtrl(), store)
+    assert page.stale.value() == PulseConfig().health.stale_trade_s and page.min_tpm.value() == PulseConfig().health.min_trades_per_min
+    custom = PulseConfig().model_dump()
+    custom["health"].update({"stale_trade_s": 120, "min_trades_per_min": 1.0})
+    store.set_setting("pulse.config", custom)
+    assert PulsePage(FakeCtrl(), store).stale.value() == 120  # a user's own choice is kept
 
 
 def test_pulse_page_renders_all_states(app):
