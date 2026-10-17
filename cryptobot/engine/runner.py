@@ -69,7 +69,7 @@ def engine_main(cmd_q, evt_q, config: dict[str, Any]) -> None:
 
 async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
     store = Store(Path(config["db_path"]))
-    holder: dict[str, Any] = {"trader": None, "pulse": None, "ew": None, "ew_task": None, "ew_stop": None, "conn": None}
+    holder: dict[str, Any] = {"trader": None, "pulse": None, "ew": None, "ew_task": None, "ew_stop": None, "conn": None, "pulse_feed_task": None, "pulse_feed_stop": None}
     base_tfs = tuple(config.get("timeframes_s", (1, 60, 300)))
 
     def emit_all(ev: Event) -> None:
@@ -83,7 +83,7 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
             except Exception:  # noqa: BLE001 - a trader bug must not kill the data feed
                 log.exception("trader failed on %s", type(ev).__name__)
         pu: PulseEngine | None = holder["pulse"]
-        if pu is not None:
+        if pu is not None and not getattr(pu, "own_feed", False):
             try:
                 pu.on_event(ev)
             except Exception:  # noqa: BLE001
@@ -117,6 +117,16 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
         stop = asyncio.Event()
         feed = make_feed(market["exchange"], market["symbols"], market["tf"])
         feed_task = asyncio.create_task(feed.run(stop))
+
+    async def stop_pulse_feed() -> None:
+        if holder["pulse_feed_stop"] is not None:
+            holder["pulse_feed_stop"].set()
+        if holder["pulse_feed_task"] is not None:
+            try:
+                await asyncio.wait_for(holder["pulse_feed_task"], timeout=10)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                holder["pulse_feed_task"].cancel()
+        holder["pulse_feed_task"], holder["pulse_feed_stop"] = None, None
 
     loop = asyncio.get_running_loop()
     try:
@@ -177,17 +187,36 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
             elif kind == "pulse_start":
                 if holder["pulse"] is not None:
                     holder["pulse"].stop()
+                    holder["pulse"] = None
+                await stop_pulse_feed()
                 pcfg = PulseConfig.model_validate(cmd.get("config") or {})
-                pu = PulseEngine(store, evt_q.put, market["exchange"], market["symbols"], pcfg, slippage_pct=float(cmd.get("slippage_pct", 0.05)))
-                if holder["conn"] is not None:
-                    pu.on_event(holder["conn"])  # the feed may already be connected; Pulse must not wait for an event that never comes
+                p_ex = cmd.get("exchange") or market["exchange"]
+                p_syms = list(cmd.get("symbols") or market["symbols"])
+                own_feed = (p_ex, p_syms) != (market["exchange"], list(market["symbols"]))
+                pu = PulseEngine(store, evt_q.put, p_ex, p_syms, pcfg, slippage_pct=float(cmd.get("slippage_pct", 0.05)))
+                if own_feed:
+                    # Pulse is paper-only and needs no key: it may watch a liquid exchange while the trader stays on another.
+                    # Its feed's events go to the Pulse engine only, never to the Market page or the trader.
+                    def pulse_emit(ev: Event, _pu=pu) -> None:
+                        try:
+                            _pu.on_event(ev)
+                        except Exception:  # noqa: BLE001
+                            log.exception("pulse failed on %s", type(ev).__name__)
+
+                    pfeed = MarketFeed(p_ex, p_syms, pulse_emit, timeframes_s=(1, 60), history_bars=120)
+                    holder["pulse_feed_stop"] = asyncio.Event()
+                    holder["pulse_feed_task"] = asyncio.create_task(pfeed.run(holder["pulse_feed_stop"]), name="pulse-feed")
+                    pu.own_feed = True
+                elif holder["conn"] is not None:
+                    pu.on_event(holder["conn"])  # the main feed may already be connected; Pulse must not wait for an event that never comes
                 pu.start()
                 holder["pulse"] = pu
-                log.info("pulse started on %s", ", ".join(market["symbols"]))
+                log.info("pulse started on %s %s%s", p_ex, ", ".join(p_syms), " (own feed)" if own_feed else "")
             elif kind == "pulse_stop":
                 if holder["pulse"] is not None:
                     holder["pulse"].stop()
                     holder["pulse"] = None
+                await stop_pulse_feed()
             elif kind == "ew_start":
                 if holder["ew"] is not None:
                     holder["ew_stop"].set()
@@ -228,6 +257,7 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
             trader.stop("engine shutting down")
         if holder["pulse"] is not None:
             holder["pulse"].stop()
+        await stop_pulse_feed()
         if holder["ew"] is not None:
             holder["ew_stop"].set()
             try:

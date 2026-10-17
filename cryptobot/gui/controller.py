@@ -144,8 +144,9 @@ class EngineController(QObject):
     def set_limits(self, limits: RiskLimits) -> None:
         self._cmd(type="set_limits", limits=limits.model_dump())
 
-    def pulse_start(self, config: dict, slippage_pct: float) -> None:
-        self._cmd(type="pulse_start", config=config, slippage_pct=slippage_pct)
+    def pulse_start(self, config: dict, slippage_pct: float, exchange: str | None = None, symbols: list[str] | None = None) -> None:
+        """Start Pulse on its own exchange/coins (paper, no key needed) or, with neither given, on the Market page's feed."""
+        self._cmd(type="pulse_start", config=config, slippage_pct=slippage_pct, exchange=exchange, symbols=list(symbols) if symbols else None)
 
     def pulse_stop(self) -> None:
         self._cmd(type="pulse_stop")

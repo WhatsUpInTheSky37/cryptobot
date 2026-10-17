@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from cryptobot.config import DEFAULT_EXCHANGE, EXCHANGES
 from cryptobot.core.events import PulseEventRecord, PulseModeStatus, PulseSnapshot, PulseStatusEvent
 from cryptobot.db.store import Store
 from cryptobot.gui.controller import EngineController
@@ -300,6 +302,23 @@ class PulsePage(QWidget):
         sf = QFormLayout()
         sf.setContentsMargins(0, 0, 0, 0)
         sf_box.addLayout(sf)
+        self.exchange = QComboBox()
+        self.exchange.addItem("Same as Market page", "")
+        for ex_id, meta in EXCHANGES.items():
+            self.exchange.addItem(meta["name"], ex_id)
+        saved_ex = self.store.get_setting("pulse.exchange", "")
+        i = self.exchange.findData(saved_ex)
+        self.exchange.setCurrentIndex(i if i >= 0 else 0)
+        self.exchange.setToolTip("Pulse is paper-only and needs no API key, so it can watch a liquid exchange (Coinbase, Kraken) while the trader stays on yours. 'Same as Market page' shares the trader's feed.")
+        self.exchange.currentIndexChanged.connect(self._exchange_changed)
+        sf.addRow("Exchange", self.exchange)
+        self.symbols = QLineEdit()
+        self.symbols.setPlaceholderText("coins, comma separated, e.g. BTC/USD, ETH/USD")
+        self.symbols.setToolTip("Coins Pulse watches on that exchange. Liquid pairs give meaningful order-flow scores; thin ones show INSUFFICIENT DATA.")
+        saved_syms = self.store.get_setting("pulse.symbols")
+        self.symbols.setText(", ".join(saved_syms) if saved_syms else "")
+        self._exchange_changed(self.exchange.currentIndex())
+        sf.addRow("Coins", self.symbols)
         self.budget = QDoubleSpinBox()
         self.budget.setRange(10, 100_000)
         self.budget.setPrefix("$")
@@ -446,6 +465,23 @@ class PulsePage(QWidget):
 
     # ------------------------------------------------------------ commands
 
+    def _exchange_changed(self, _idx: int) -> None:
+        ex_id = self.exchange.currentData()
+        self.symbols.setEnabled(bool(ex_id))
+        if not ex_id:
+            self.symbols.setText("")
+            self.symbols.setPlaceholderText("uses the Market page's exchange and coins")
+            return
+        if not self.symbols.text().strip() or self.store.get_setting("pulse.exchange", "") != ex_id:
+            self.symbols.setText(", ".join(EXCHANGES[ex_id]["symbols"]))
+
+    def _feed_choice(self) -> tuple[str | None, list[str] | None]:
+        ex_id = self.exchange.currentData()
+        if not ex_id:
+            return None, None
+        syms = [t.strip().upper() for t in self.symbols.text().replace(";", ",").split(",") if t.strip()]
+        return ex_id, (syms or list(EXCHANGES.get(ex_id, EXCHANGES[DEFAULT_EXCHANGE])["symbols"]))
+
     def _config(self) -> PulseConfig:
         risk = self.cfg.risk.model_copy(update={"risk_per_trade_pct": self.risk.value(), "daily_loss_pct": self.daily.value(), "max_positions": self.maxpos.value()})
         health = self.cfg.health.model_copy(update={"stale_trade_s": self.stale.value(), "min_trades_per_min": self.min_tpm.value()})
@@ -458,9 +494,12 @@ class PulsePage(QWidget):
     def start(self) -> None:
         cfg = self._config()
         slip = float(self.store.get_setting("backtest.settings", {}).get("slippage_pct", 0.05))
-        self.ctrl.pulse_start(cfg.model_dump(), slip)
+        ex_id, syms = self._feed_choice()
+        self.store.set_setting("pulse.exchange", ex_id or "")
+        self.store.set_setting("pulse.symbols", syms or [])
+        self.ctrl.pulse_start(cfg.model_dump(), slip, ex_id, syms)
         self.store.set_setting("pulse.running", True)
-        self.s_msg.setText("Starting…")
+        self.s_msg.setText("Starting…" + (f" on {EXCHANGES[ex_id]['name']}: {', '.join(syms)}" if ex_id and syms else ""))
 
     def stop(self) -> None:
         self.ctrl.pulse_stop()

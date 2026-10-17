@@ -25,8 +25,8 @@ class FakeCtrl(QObject):
         super().__init__()
         self.cmds = []
 
-    def pulse_start(self, cfg, slip):
-        self.cmds.append(("start", cfg, slip))
+    def pulse_start(self, cfg, slip, exchange=None, symbols=None):
+        self.cmds.append(("start", cfg, slip, exchange, symbols))
 
     def pulse_stop(self):
         self.cmds.append(("stop",))
@@ -54,6 +54,13 @@ def test_pulse_page_renders_all_states(app):
     page = PulsePage(ctrl, store)
     page.start()
     assert ctrl.cmds[0][0] == "start" and ctrl.cmds[0][1]["budget"] == page.cfg.budget and len(ctrl.cmds[0][1]["modes"]) == 3
+    assert ctrl.cmds[0][3:] == (None, None)  # default: the Market page's feed
+    page.exchange.setCurrentIndex(page.exchange.findData("coinbase"))
+    assert "BTC/USD" in page.symbols.text()
+    page.symbols.setText("btc/usd, eth/usd")
+    page.start()
+    assert ctrl.cmds[-1][3:] == ("coinbase", ["BTC/USD", "ETH/USD"])
+    assert store.get_setting("pulse.exchange") == "coinbase" and store.get_setting("pulse.symbols") == ["BTC/USD", "ETH/USD"]
     snaps = [
         PulseSnapshot("ETH/USDT", 1, "excluded", 0, 0, 0, 0, 0, 0, 0, 0.0, 3000.0, 0.0, 0.1, "", False, "stale_trades", "last trade 120s ago", "range"),
         PulseSnapshot("BTC/USDT", 1, "prepared", 88.0, 20.0, 90, 90, 90, 90, 90, 0.5, 80_000.0, 0.01, 0.2, "prepared", True, "ok", "", "trend_up",
