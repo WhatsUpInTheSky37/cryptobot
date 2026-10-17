@@ -167,11 +167,24 @@ class BinanceUSData:
 
     # -- aggregated trades -------------------------------------------------------
 
-    def fetch_agg_trades(self, market_id: str, start_ms: int, end_ms: int, *, max_rows: int | None = None) -> list[tuple]:
-        """(agg_id, ts, price, qty, buyer_maker). Pages by fromId after the first time-window request."""
+    def fetch_agg_trades(self, market_id: str, start_ms: int, end_ms: int, *, max_rows: int | None = None, empty_windows: int = 72) -> list[tuple]:
+        """(agg_id, ts, price, qty, buyer_maker). Pages by fromId after the first time-window request.
+
+        Binance answers a time-window request with the trades of at most one hour. On a thin pair, or
+        before the pair was listed, that first hour can be empty, so the window walks forward hour by
+        hour (up to ``empty_windows`` hours) until it finds the first trade; from there paging by id
+        continues across any gap."""
         out: list[tuple] = []
-        raw = self.client.publicGetAggTrades({"symbol": market_id, "startTime": int(start_ms), "endTime": int(min(end_ms, start_ms + 3_600_000)), "limit": 1000})
-        self._throttle()
+        window = int(start_ms)
+        raw: list[Any] = []
+        for _ in range(max(1, empty_windows)):
+            if window >= end_ms:
+                break
+            raw = self.client.publicGetAggTrades({"symbol": market_id, "startTime": window, "endTime": int(min(end_ms, window + 3_600_000)), "limit": 1000})
+            self._throttle()
+            if raw:
+                break
+            window += 3_600_000
         while raw:
             for t in raw:
                 ts = int(t["T"])
@@ -197,6 +210,13 @@ class BinanceUSData:
         rng = self.store.aggtrade_range(symbol)
         if rng and rng[1] >= start:
             start = rng[1] + 1
+        else:
+            # seed the first time window from the first candle that actually traded at or after the start
+            # (the pair may be younger than the requested history, or simply idle for hours at a time)
+            k = self.store.klines(symbol, "1m", start_ms=start)
+            traded = k[k["trades"] > 0] if len(k) else k
+            if len(traded):
+                start = max(start, int(traded["ts"][0]))
         rows = self.fetch_agg_trades(market_id, start, now_ms, max_rows=max_rows)
         n = self.store.upsert_aggtrades(symbol, rows)
         rng = self.store.aggtrade_range(symbol)

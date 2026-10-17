@@ -51,6 +51,9 @@ class EWStore:
         self.con.execute("INSERT OR REPLACE INTO ew_settings (key, value) VALUES (?, ?)", (key, json.dumps(value, default=float)))
         self.con.commit()
 
+    def close(self) -> None:
+        self.con.close()
+
     def put_study(self, key: str, value: Any) -> None:
         self.con.execute("INSERT OR REPLACE INTO ew_study (key, value, updated_ms) VALUES (?, ?, ?)", (key, json.dumps(value, default=float), int(time.time() * 1000)))
         self.con.commit()
@@ -68,6 +71,17 @@ class EWStore:
     def markets(self) -> list[dict[str, Any]]:
         cur = self.con.execute("SELECT symbol, market_id, status, available, spot, base, quote, note, checked_ms FROM ew_markets ORDER BY symbol")
         return [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
+
+    def delete_symbol(self, symbol: str) -> None:
+        """Remove a market and every row of data derived from it (candles, trades, events, windows, downloads)."""
+        for table in ("ew_markets", "ew_klines", "ew_aggtrades", "ew_downloads", "ew_events", "ew_windows"):
+            self.con.execute(f"DELETE FROM {table} WHERE symbol=?", (symbol,))
+        self.con.commit()
+
+    def daily_quote_volumes(self, symbol: str, interval: str = "1m") -> list[float]:
+        """Quote volume summed per UTC day, oldest first (days with at least one candle)."""
+        cur = self.con.execute("SELECT ts / 86400000 AS d, SUM(quote_volume) FROM ew_klines WHERE symbol=? AND interval=? GROUP BY d ORDER BY d", (symbol, interval))
+        return [float(r[1] or 0.0) for r in cur.fetchall()]
 
     # -- klines --------------------------------------------------------------
 

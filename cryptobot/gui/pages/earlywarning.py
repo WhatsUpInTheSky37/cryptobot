@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 from cryptobot.config import AppPaths
 from cryptobot.core.events import EWCandidateView, EWStatusEvent
 from cryptobot.db.store import Store
+from cryptobot.earlywarning.cli import ew_db_path
 from cryptobot.earlywarning.config import COMPONENT_NAMES, COMPONENTS, EWConfig
 from cryptobot.earlywarning.report import build_report
 from cryptobot.earlywarning.store import EWStore
@@ -86,14 +87,14 @@ class _ResearchRunner(QObject):
 
     def _run(self) -> None:
         try:
-            from cryptobot.earlywarning.cli import research
+            from cryptobot.earlywarning.cli import report_path, research
 
             store = EWStore(self.db_path)
             cfg = EWConfig.model_validate(store.get("config") or {})
             cfg.days = self.days
             research(store, cfg, demo=self.demo, progress=self.line.emit)
             text = build_report(store, cfg, demo=self.demo)
-            self.db_path.with_name("earlywarning-report.md").write_text(text)
+            report_path(self.db_path, demo=self.demo).write_text(text)
             self.line.emit("report written")
             self.done.emit(True)
         except Exception as e:  # noqa: BLE001
@@ -106,11 +107,14 @@ class EarlyWarningPage(QWidget):
         super().__init__()
         self.ctrl = ctrl
         self.main_store = store
-        self.db_path = (paths or AppPaths.default()).data_dir / "earlywarning.db"
+        self.db_path = ew_db_path(paths)
+        self.demo_db_path = ew_db_path(paths, demo=True)
         self.ew = EWStore(self.db_path)
+        self.view = self.ew  # the store the Research/Explorer tabs show: the real one, or the demo one after a demo run
         self.cfg = EWConfig.model_validate(self.ew.get("config") or {})
         self._views: dict[str, EWCandidateView] = {}
         self._runner: _ResearchRunner | None = None
+        self._pending_demo = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
@@ -294,7 +298,12 @@ class EarlyWarningPage(QWidget):
         self.r_log.clear()
         self.r_run.setEnabled(False)
         self.r_demo.setEnabled(False)
-        self._runner = _ResearchRunner(self.db_path, demo, self.r_days.value())
+        if demo:
+            demo_store = EWStore(self.demo_db_path)
+            demo_store.set("config", self.cfg.model_dump())
+            demo_store.close()
+        self._pending_demo = demo
+        self._runner = _ResearchRunner(self.demo_db_path if demo else self.db_path, demo, self.r_days.value())
         self._runner.line.connect(self.r_log.appendPlainText)
         self._runner.done.connect(self._research_done)
         self._runner.start()
@@ -303,12 +312,14 @@ class EarlyWarningPage(QWidget):
         self._runner = None
         self.r_run.setEnabled(True)
         self.r_demo.setEnabled(True)
+        if ok:
+            self.view = EWStore(self.demo_db_path) if self._pending_demo else self.ew
         self._refresh_research_labels()
-        self._load_symbols()
 
     def _refresh_research_labels(self) -> None:
+        demo = self.view is not self.ew
         try:
-            self.r_report.setPlainText(build_report(self.ew, self.cfg))
+            self.r_report.setPlainText(build_report(self.view, self.cfg, demo=demo))
         except Exception as e:  # noqa: BLE001
             self.r_report.setPlainText(f"no report yet ({e})")
         self._load_symbols()
@@ -378,7 +389,7 @@ class EarlyWarningPage(QWidget):
         cur = self.ex_symbol.currentText()
         self.ex_symbol.blockSignals(True)
         self.ex_symbol.clear()
-        for m in self.ew.markets():
+        for m in self.view.markets():
             if m.get("available"):
                 self.ex_symbol.addItem(m["symbol"])
         if cur:
@@ -394,9 +405,9 @@ class EarlyWarningPage(QWidget):
         if not sym:
             self.ex_count.setText("run the research first")
             return
-        self._events = self.ew.events(sym)
+        self._events = self.view.events(sym)
         leads = {}
-        for w in self.ew.windows(sym, kind="lead"):
+        for w in self.view.windows(sym, kind="lead"):
             leads.setdefault(w["event_id"], {})[w["lookback_min"]] = w["eas"]
         rows = []
         for e in self._events:
@@ -415,7 +426,7 @@ class EarlyWarningPage(QWidget):
                          f"{e['minutes_to_reversal']:.0f}" if e.get("minutes_to_reversal") is not None else "—", _pct(e.get("max_decline_pct"), 1), f"{e.get('quote_volume') or 0:,.0f}",
                          f"{run} min before" if run else "not before the start", hyp["enter"], hyp["result"]])
         _fill(self.ev_table, rows)
-        self.ex_count.setText(f"{len(self._events)} events")
+        self.ex_count.setText(f"{len(self._events)} events" + (" (SYNTHETIC demo data)" if self.view is not self.ew else ""))
 
     def _hypothetical(self, sym: str, e: dict[str, Any]) -> dict[str, str]:
         """Would entry method A have fired, and what would the partial-exit paper trade have done?"""
@@ -426,7 +437,7 @@ class EarlyWarningPage(QWidget):
         if trigger_off is None:
             return {"enter": "no (EAS never reached the confirmed level before the start)", "result": "—"}
         t0 = e["start_ms"] - trigger_off * 60_000
-        k = self.ew.klines(sym, "1m", start_ms=t0 - 3 * 86_400_000, end_ms=e["peak_ms"] + 6 * 3_600_000)
+        k = self.view.klines(sym, "1m", start_ms=t0 - 3 * 86_400_000, end_ms=e["peak_ms"] + 6 * 3_600_000)
         if len(k) == 0:
             return {"enter": f"yes, {trigger_off} min before", "result": "no candles"}
         tr = simulate_trade(k, None, sym, t0, "A", "partial", self.cfg, budget=self.cfg.risk.budget)
@@ -441,7 +452,7 @@ class EarlyWarningPage(QWidget):
         e = self._events[items[0].row()]
         sym = self.ex_symbol.currentText()
         lo, hi = e["start_ms"] - 6 * 3_600_000, e["peak_ms"] + 3 * 3_600_000
-        k = self.ew.klines(sym, "1m", start_ms=lo, end_ms=hi)
+        k = self.view.klines(sym, "1m", start_ms=lo, end_ms=hi)
         if len(k):
             self.ev_price.setData(k["ts"] / 1000.0, k["close"])
             base = float(k["quote_volume"].mean()) or 1.0
@@ -461,7 +472,7 @@ class EarlyWarningPage(QWidget):
             self.ev_plot.addItem(ln)
         self.ev_vb2.setYRange(0, 100)
         self.ev_vb2.setGeometry(self.ev_plot.getViewBox().sceneBoundingRect())
-        wins = {w["lookback_min"]: w for w in self.ew.windows(sym, kind="event") if w["event_id"] == e["id"]}
+        wins = {w["lookback_min"]: w for w in self.view.windows(sym, kind="event") if w["event_id"] == e["id"]}
         lines = [f"{sym} surge starting {_ts(e['start_ms'])} (thresholds {', '.join(e.get('thresholds', []))})",
                  f"price before {e['pre_price']:.6g} → peak {e['peak_price']:.6g} ({e['gain_pct']:+.1f}%) in {e['minutes_to_peak']:.0f} min; executable bid at peak ≈ {e['peak_bid']:.6g}" if e.get("peak_bid") else f"price before {e['pre_price']:.6g} → peak {e['peak_price']:.6g} ({e['gain_pct']:+.1f}%)",
                  f"reversal after {e['minutes_to_reversal']:.0f} min; max decline after peak {_pct(e.get('max_decline_pct'), 1)}" if e.get("minutes_to_reversal") is not None else f"no reversal within the search window; max decline after peak {_pct(e.get('max_decline_pct'), 1)}",

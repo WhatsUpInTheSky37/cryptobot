@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from statistics import median
 from typing import Any
 
 from cryptobot.earlywarning.config import EWConfig
@@ -25,14 +26,23 @@ def build_report(store: EWStore, cfg: EWConfig, *, demo: bool = False) -> str:
     if demo or run.get("demo"):
         lines += ["> **SYNTHETIC DATA.** This report was produced from generated candles to exercise the pipeline. It says nothing about real markets.", ""]
     lines += [f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · exchange {run.get('exchange', 'binanceus')} · requested {run.get('days', cfg.days)} days · paper only.", ""]
-    lines += ["## 1. Markets and data", "", "| Symbol | Binance.US id | Status | Available | 1m candles | Aggregated trades | Note |", "|---|---|---|---|---|---|---|"]
+    min_vol = cfg.scanner.min_quote_volume_24h
+    lines += ["## 1. Markets and data", "", "| Symbol | Binance.US id | Status | Available | 1m candles | Aggregated trades | Median daily volume | Note |", "|---|---|---|---|---|---|---|---|"]
     dl = {(d["symbol"], d["kind"]): d for d in downloads}
+    thin: list[str] = []
     for m in markets:
         k1 = dl.get((m["symbol"], "klines_1m"))
         tr = dl.get((m["symbol"], "aggtrades"))
         span = f"{k1['rows']} ({datetime.fromtimestamp(k1['first_ms'] / 1000, timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(k1['last_ms'] / 1000, timezone.utc):%Y-%m-%d})" if k1 else "none"
-        lines.append(f"| {m['symbol']} | {m['market_id']} | {m['status']} | {'yes' if m['available'] else 'NO'} | {span} | {tr['rows'] if tr else 'none'} | {m['note'] or ''} |")
+        vols = store.daily_quote_volumes(m["symbol"]) if k1 else []
+        med = float(median(vols)) if vols else None
+        if med is not None and med < min_vol and m["available"]:
+            thin.append(m["symbol"])
+        vol = "—" if med is None else f"{med:,.0f} {m['quote']}" + (" (THIN)" if med < min_vol else "")
+        lines.append(f"| {m['symbol']} | {m['market_id']} | {m['status']} | {'yes' if m['available'] else 'NO'} | {span} | {tr['rows'] if tr else 'none'} | {vol} | {m['note'] or ''} |")
     lines += ["", "Individual historical trades require an API key on Binance.US and were not used; aggregated trades carry the taker side. Historical order-book snapshots do not exist on the exchange, so bid prices are approximated by the last sell-taker print near each moment (or an assumed spread where no trade is available).", ""]
+    if thin:
+        lines += [f"**THIN MARKETS.** {', '.join(thin)} traded a median of less than {min_vol:,.0f} per day in this data, which is the live scanner's minimum. Surges on such a pair are often a handful of trades crossing a wide spread; the event and method statistics below describe them, but a paper position could not have been filled at those prices and the live scanner would not select the pair.", ""]
     lines += ["## 2. Surge events", ""]
     for sym, r in per_coin.items():
         evs = store.events(sym)

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 — Early Warning research: demo data kept apart, thin pairs named
+
+- Demo runs now use their own database (`earlywarning-demo.db`, report `earlywarning-demo-report.md`). A demo run analyses only its synthetic markets, and a real run removes any synthetic rows an earlier demo left in `earlywarning.db`, so real and generated data can no longer be pooled in one report or feed the live scanner's targets.
+- Aggregated-trade download seeds its first time window from the first candle that actually traded and walks forward through idle hours. Pairs younger than the requested history (or idle at its start) previously came back with no trades at all, which silenced every trade-based feature.
+- The report's market table gains a median daily quote volume column; pairs below the scanner's minimum are flagged THIN, with a note that their surge statistics describe fills a position could not have had.
+
 ## 0.4.0 — Early Warning: accumulation & surge detection (paper only)
 
 A new, independent module and navigation item. See `docs/early-warning.md`.

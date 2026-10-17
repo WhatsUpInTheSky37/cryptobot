@@ -25,8 +25,26 @@ from cryptobot.earlywarning.synth import synthetic_aggtrades, synthetic_klines
 log = logging.getLogger("earlywarning")
 
 
-def ew_db_path(paths: AppPaths | None = None) -> Path:
-    return (paths or AppPaths.default()).data_dir / "earlywarning.db"
+SYNTHETIC_NOTE = "synthetic"
+
+
+def ew_db_path(paths: AppPaths | None = None, *, demo: bool = False) -> Path:
+    """The Early Warning database. Demo runs use their own file so generated data never mixes with
+    real Binance.US data, and the live scanner never picks up targets validated on synthetic candles."""
+    return (paths or AppPaths.default()).data_dir / ("earlywarning-demo.db" if demo else "earlywarning.db")
+
+
+def report_path(db: Path, *, demo: bool = False) -> Path:
+    return db.with_name("earlywarning-demo-report.md" if demo else "earlywarning-report.md")
+
+
+def purge_synthetic(store: EWStore, progress: Callable[[str], None] = print) -> list[str]:
+    """Remove markets written by an earlier demo run (and all their data) from a real database."""
+    gone = [m["symbol"] for m in store.markets() if m.get("note") == SYNTHETIC_NOTE]
+    for sym in gone:
+        store.delete_symbol(sym)
+        progress(f"{sym}: removed synthetic demo data left by an earlier demo run")
+    return gone
 
 
 def research(store: EWStore, cfg: EWConfig, *, data: BinanceUSData | None = None, demo: bool = False, progress: Callable[[str], None] = print, trades: bool = True, max_trade_rows: int | None = None) -> dict[str, Any]:
@@ -35,17 +53,20 @@ def research(store: EWStore, cfg: EWConfig, *, data: BinanceUSData | None = None
     symbols = list(cfg.seed_symbols)
     if demo:
         progress("DEMO: generating synthetic candles and trades (not market data)")
+        recs = []
         for i, sym in enumerate(symbols):
             k, _starts = synthetic_klines(days=min(cfg.days, 45), seed=10 + i, surges=6 + i)
             tr, rows = synthetic_aggtrades(k, seed=20 + i, per_bar=3)
-            store.put_market(sym, sym.replace("/", ""), "TRADING", True, True, *sym.split("/"), note="synthetic")
+            store.put_market(sym, sym.replace("/", ""), "TRADING", True, True, *sym.split("/"), note=SYNTHETIC_NOTE)
             store.upsert_klines(sym, "1m", [tuple(r) for r in k.tolist()])
             store.upsert_aggtrades(sym, rows)
             rng = store.kline_range(sym, "1m")
-            store.put_download(sym, "klines_1m", rng[0], rng[1], rng[2], "synthetic")
-            store.put_download(sym, "aggtrades", int(tr["ts"][0]), int(tr["ts"][-1]), len(rows), "synthetic")
-        recs = store.markets()
+            store.put_download(sym, "klines_1m", rng[0], rng[1], rng[2], SYNTHETIC_NOTE)
+            store.put_download(sym, "aggtrades", int(tr["ts"][0]), int(tr["ts"][-1]), len(rows), SYNTHETIC_NOTE)
+            recs.append({"symbol": sym, "available": True})
+        # only this run's synthetic markets are analysed, never real rows that may share the database
     else:
+        purge_synthetic(store, progress)
         data = data or BinanceUSData(make_client("binanceus"), store)
         recs = download_all(data, symbols, cfg.days, trades=trades, progress=progress, max_trade_rows=max_trade_rows)
     available = [r["symbol"] for r in recs if r["available"]]
@@ -96,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--db")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    db = Path(args.db) if args.db else ew_db_path()
+    db = Path(args.db) if args.db else ew_db_path(demo=getattr(args, "demo", False))
     store = EWStore(db)
     cfg = EWConfig.model_validate(store.get("config") or {})
     if args.cmd == "report":
@@ -107,9 +128,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg.days = args.days
     summary = research(store, cfg, demo=args.demo, trades=not args.no_trades, max_trade_rows=args.max_trade_rows)
     text = build_report(store, cfg, demo=args.demo)
-    out = db.with_name("earlywarning-report.md")
+    out = report_path(db, demo=args.demo)
     out.write_text(text)
-    (db.with_name("earlywarning-summary.json")).write_text(json.dumps(summary, indent=2, default=float))
+    out.with_suffix(".json").write_text(json.dumps(summary, indent=2, default=float))
     print(text)
     print(f"\nreport written to {out}")
     return 0

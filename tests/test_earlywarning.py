@@ -7,7 +7,8 @@ import pytest
 from cryptobot.core.events import BookEvent, ConnectionEvent, EWStatusEvent, HeartbeatEvent, TickEvent
 from cryptobot.core.models import Tick
 from cryptobot.earlywarning import backtest, study
-from cryptobot.earlywarning.cli import research
+from cryptobot.config import AppPaths
+from cryptobot.earlywarning.cli import ew_db_path, research
 from cryptobot.earlywarning.config import COMPONENTS, EWConfig, SurgeConfig, SurgeThreshold
 from cryptobot.earlywarning.data import BinanceUSData, download_all
 from cryptobot.earlywarning.engine import EarlyWarningEngine
@@ -108,6 +109,45 @@ def test_download_is_resumable_and_backs_off_on_weight(synth):
     recs = download_all(data, ["POND/USD", "MXC/USD"], 2, progress=lambda m: None)
     assert [(r["symbol"], r["available"]) for r in recs] == [("POND/USD", True), ("MXC/USD", False), ("MXC/USDT", True)]
     assert "substituted for MXC/USD" in [m for m in store.markets() if m["symbol"] == "MXC/USDT"][0]["note"]
+
+
+def test_agg_trades_seed_from_first_traded_candle_and_walk_empty_hours(synth):
+    k, _s, _tr, rows = synth
+    k = k.copy()
+    day5 = int(k["ts"][0]) + 5 * 86_400_000
+    k["trades"][k["ts"] < day5] = 0  # the pair did not trade for its first five days (e.g. listed later than the requested history)
+    late = [r for r in rows if r[1] > day5 + 2 * 3_600_000]  # and the first two hours after that were idle too
+    store = EWStore(":memory:")
+    client = FakeBinanceUS(k, late)
+    data = BinanceUSData(client, store, sleep=lambda s: None)
+    data.download_klines("POND/USD", "PONDUSD", "1m", days=12)
+    n = data.download_agg_trades("POND/USD", "PONDUSD", days=12)
+    assert n == len(late) > 0
+    first = [p for kind, p in client.calls if kind == "agg" and "startTime" in p]
+    assert first[0]["startTime"] == day5, "the first time window starts at the first traded candle, not at the requested start"
+    assert len(first) == 3, "two empty hours were walked before the first trade was found"
+    assert store.aggtrade_range("POND/USD")[3] == len(late)
+
+
+def test_demo_runs_never_mix_with_real_rows_and_a_real_run_purges_them(synth, tmp_path):
+    k, _s, _tr, rows = synth
+    store = EWStore(tmp_path / "ew.db")
+    store.put_market("COMP/USDT", "COMPUSDT", "TRADING", True, True, "COMP", "USDT", note="substituted for COMP/USD (BREAK)")
+    store.upsert_klines("COMP/USDT", "1m", [tuple(r) for r in k.tolist()])
+    cfg = EWConfig(days=12)
+    cfg.seed_symbols = ["POND/USD"]
+    summary = research(store, cfg, demo=True, progress=lambda m: None)
+    assert set(summary["events"]) == {"POND/USD"} and set(store.get_study("compare")) == {"POND/USD"}, "a demo run analyses only its own synthetic markets"
+    assert {m["symbol"]: m["note"] for m in store.markets()} == {"COMP/USDT": "substituted for COMP/USD (BREAK)", "POND/USD": "synthetic"}
+    lines = []
+    data = BinanceUSData(FakeBinanceUS(k, rows), store, sleep=lambda s: None)
+    research(store, cfg, data=data, demo=False, progress=lines.append)
+    assert any("removed synthetic demo data" in m for m in lines)
+    assert all(m["note"] != "synthetic" for m in store.markets()) and all(d["note"] != "synthetic" for d in store.downloads())
+    assert not store.get_study("run")["demo"] and set(store.get_study("compare")) == {"POND/USD"}
+    text = build_report(store, cfg)
+    assert "SYNTHETIC DATA" not in text and "Median daily volume" in text and "THIN" in text, "a thin pair is named as such in the report"
+    assert ew_db_path(AppPaths(tmp_path, tmp_path), demo=True).name == "earlywarning-demo.db" and ew_db_path(AppPaths(tmp_path, tmp_path)).name == "earlywarning.db"
 
 
 # ---------------------------------------------------------------- events

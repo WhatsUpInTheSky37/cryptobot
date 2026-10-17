@@ -32,7 +32,7 @@ item, and no path to a real order.
 # or from the app: Early Warning → Research → Run research
 ```
 
-The report lands next to the database (`earlywarning-report.md`, `earlywarning-summary.json`) and in the Research tab. `--demo` runs the same pipeline on synthetic data and labels the result as such.
+The report lands next to the database (`earlywarning-report.md`, `earlywarning-report.json`) and in the Research tab. `--demo` runs the same pipeline on synthetic data in a separate database (`earlywarning-demo.db`, report `earlywarning-demo-report.md`) and labels the result as such; a real run removes any synthetic rows an older build left in `earlywarning.db`. The market table shows each pair's median daily quote volume and marks pairs under the scanner's minimum as THIN: their surges are mostly a few trades crossing a wide spread, and the live scanner would not select them.
 
 ## Database (`earlywarning.db`)
 
