@@ -4,7 +4,9 @@ import os
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-pytest.importorskip("PySide6.QtWidgets")
+# Qt needs libEGL/libGL on the host; without them the import fails with ImportError (not ModuleNotFoundError), which
+# pytest >= 8.2 no longer turns into a skip unless asked. Skip rather than error on such hosts.
+pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)
 
 from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
