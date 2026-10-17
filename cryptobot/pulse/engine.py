@@ -1,79 +1,87 @@
-"""The Pulse engine: observe → score → prepare → confirm → (paper) trade → learn.
+"""The Pulse engine: validate data → observe → score → detect → record → (paper) trade → learn.
 
-Long-only: spot accounts cannot short, so bearish setups are recorded for
-research but never traded. All trades go through the same RiskManager and
-SimulatedExecutor as the main bot, with mode "PULSE".
+One scanner sees every coin. For each coin it checks data health first; a coin
+with stale, unsynced or insufficient data produces no scores and no signals.
+Healthy coins are observed every few seconds, scored long and short, and when a
+pressure setup triggers, one Market Memory event is recorded (immutable
+signal-time values) and handed to the three paper-trading modes, which decide
+independently. Every event, taken or not, is followed forward for 20 minutes
+with the same cost assumptions so the memory learns from everything.
+
+Paper only. Spot cannot short, so bearish setups are research only. All
+orders go through the shared RiskManager and the SimulatedExecutor.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
 
 from cryptobot.core.events import (
     BarsEvent,
     BookEvent,
+    BookSyncEvent,
+    ConnectionEvent,
     HeartbeatEvent,
     MarketInfoEvent,
     PulseEventRecord,
+    PulseModeStatus,
     PulseSnapshot,
     PulseStatusEvent,
     TickEvent,
 )
 from cryptobot.core.models import Bar
 from cryptobot.db.store import Store
-from cryptobot.engine.executors import SimulatedExecutor
-from cryptobot.engine.risk import MarketInfo, OrderIntent, Rejection, RiskContext, RiskLimits, RiskManager
+from cryptobot.engine.risk import MarketInfo, Rejection
+from cryptobot.pulse import ml as mlmod
 from cryptobot.pulse.config import PulseConfig, break_even_win_rate, expected_value_pct
+from cryptobot.pulse.costs import assess, expected_move_pct, plan_exits, round_trip_costs
 from cryptobot.pulse.features import Observation, Scores, SymbolFeatures
-from cryptobot.pulse.memory import KEYS, MarketMemory
-from cryptobot.strategy.config import RiskRules
+from cryptobot.pulse.health import HealthStatus, SymbolHealth
+from cryptobot.pulse.memory import KEYS, Estimate, MarketMemory, row_from_event
+from cryptobot.pulse.outcomes import OutcomeTracker, Pending
+from cryptobot.pulse.paper import PaperTrader, Setup
+from cryptobot.pulse.regime import Regime, classify
 
 log = logging.getLogger("pulse")
 MODE = "PULSE"
+MOMENTUM_TRIGGER = 70.0  # order-flow acceleration score that triggers a decision without a breakout
 
 
 @dataclass
-class _Pending:
-    event_id: int
-    symbol: str
-    direction: str
-    entry_mid: float
-    target_pct: float
-    stop_pct: float
-    start_ms: int
-    horizon_ms: int
-    vec: dict[str, float]
-    mfe: float = 0.0
-    mae: float = 0.0
-
-
-@dataclass
-class _Position:
-    symbol: str
-    units: float
-    entry_px: float
-    cost: float
-    stop: float
-    target: float
-    entry_ms: int
-    event_id: int
+class _DirState:
+    state: str = "idle"  # idle | monitor | prepared
+    prepared_ms: int = 0
+    absorb_level: float = 0.0
+    last_event_ms: dict[str, int] = field(default_factory=lambda: {"confirmed": 0, "momentum": 0})
+    sent: set[str] = field(default_factory=set)  # trigger kinds already signalled in this prepared episode
 
 
 @dataclass
 class _SymState:
     feats: SymbolFeatures
-    state: str = "warming"
-    prepared_ms: int = 0
-    absorb_high: float = 0.0
-    last_event_ms: dict[str, int] = field(default_factory=lambda: {"long": 0, "short": 0})
+    health: SymbolHealth
+    dirs: dict[str, _DirState] = field(default_factory=lambda: {"long": _DirState(), "short": _DirState()})
+    status: HealthStatus = field(default_factory=lambda: HealthStatus("no_data", "no public trades received yet"))
     last_obs: Observation | None = None
     last_scores: tuple[Scores, Scores] | None = None
     bars_1m: list[Bar] = field(default_factory=list)
+    regime: Regime = field(default_factory=lambda: Regime("unknown", 0.0, 1.0, 0))
     note: str = ""
+    assessment: dict[str, dict[str, Any]] = field(default_factory=dict)  # direction -> display assessment
+    last_bid: float = 0.0
+    last_ask: float = 0.0
+    last_bid_depth: float = 0.0
+    book_seq: int = 0
+
+    @property
+    def state(self) -> str:
+        if not self.status.ok:
+            return "warming" if self.status.status == "insufficient_data" else "excluded"
+        order = {"prepared": 2, "monitor": 1, "idle": 0}
+        return max((d.state for d in self.dirs.values()), key=lambda s: order.get(s, 0))
 
 
 class PulseEngine:
@@ -85,7 +93,7 @@ class PulseEngine:
         symbols: list[str],
         config: PulseConfig,
         *,
-        slippage_pct: float = 0.05,
+        slippage_pct: float | None = None,
         clock: Callable[[], float] = time.time,
         timezone: str = "America/New_York",
         fallback_fee: float = 0.001,
@@ -95,44 +103,57 @@ class PulseEngine:
         self.exchange_id = exchange_id
         self.symbols = list(symbols)
         self.cfg = config
+        if slippage_pct is not None:
+            self.cfg.costs.base_slippage_pct = float(slippage_pct)
         self.clock = clock
-        self.slippage_pct = slippage_pct
+        self.timezone = timezone
         self.fallback_fee = fallback_fee
-        self._tz = ZoneInfo(timezone)
-        self.limits = RiskLimits(budget=config.budget, per_position_pct=config.per_position_pct, daily_loss_pct=config.daily_loss_pct, max_drawdown_pct=100)
-        self.risk = RiskManager(self.limits, RiskRules(stop_atr_mult=0), slippage_pct)
-        self.executor = SimulatedExecutor(self.risk, slippage_pct)
-        self.memory = MarketMemory(store, config.k_similar, config.min_similar, config.prior_p)
+        self.weights = config.weights_normalized()
         self._infos: dict[str, MarketInfo] = {}
-        self.sym: dict[str, _SymState] = {
-            s: _SymState(SymbolFeatures(s, config.window_s, config.obs_interval_s, config.history_obs, config.min_obs)) for s in self.symbols
+        self.sym: dict[str, _SymState] = {}
+        for s in self.symbols:
+            h = SymbolHealth(config.health)
+            h.min_obs = config.min_obs
+            self.sym[s] = _SymState(SymbolFeatures(s, config.window_s, config.obs_interval_s, config.history_obs, config.min_obs), h)
+        self.memory = MarketMemory(store, config.k_similar, config.min_similar, config.prior_p, config.overlap_ms)
+        self.tracker = OutcomeTracker(store, self._on_resolved)
+        self.modes: dict[str, PaperTrader] = {
+            m.key: PaperTrader(m, config, store, exchange_id, clock_ms=self._now_ms, timezone=timezone, fallback_fee=fallback_fee) for m in config.modes
         }
+        self.model: mlmod.PulseModel | None = None
+        raw = store.get_setting("pulse.ml.model")
+        if raw:
+            self.model = mlmod.PulseModel.from_json(raw)
+        self.ml_note = store.get_setting("pulse.ml.note", "") or ""
         self.running = False
-        self.cash = config.budget
-        self.positions: dict[str, _Position] = {}
-        self.pending: list[_Pending] = []
-        self.trades = 0
-        self.trade_pnl = 0.0
-        self.consecutive_losses = 0
-        self.paused_until_ms = 0
-        self.day_key = ""
-        self.day_realized = 0.0
+        self.connected = False
+        self.events_recorded = store.get_setting("pulse.events_recorded", 0) or 0
+        self.message = ""
         self._last_obs_ms = 0
         self._last_status_ms = 0
-        self.events_recorded = self.store.get_setting("pulse.events_recorded", 0) or 0
-        self.message = ""
+        self._last_minute_ms = 0
+        self._last_train_ms = 0
 
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
         self.running = True
-        self.message = "Warming up: scores need a few minutes of history per coin."
-        self.store.audit("pulse", "started", symbols=self.symbols, config=self.cfg.model_dump())
+        now = self._now_ms()
+        restored, abandoned = self.tracker.restore(now)
+        for key, m in self.modes.items():
+            m.restore(self.store.get_setting(f"pulse.mode.{key}.state"))
+        self.message = "Validating market data: scores need a few minutes of healthy history per coin."
+        if restored or abandoned:
+            self.message += f" Resumed {restored} pending setup(s); {abandoned} abandoned (not watched)."
+        self.store.audit("pulse", "started", symbols=self.symbols, config=self.cfg.model_dump(), restored=restored, abandoned=abandoned)
         self._publish(force=True)
 
     def stop(self) -> None:
-        for s in list(self.positions):
-            self._exit(s, self.sym[s].feats.last_mid, "stopped")
+        now = self._now_ms()
+        for m in self.modes.values():
+            m.close_all("stopped", self._info, now)
+            m.save()
+        self.tracker.flush(now)
         self.running = False
         self.store.audit("pulse", "stopped")
         self._publish(force=True)
@@ -140,6 +161,21 @@ class PulseEngine:
     # --------------------------------------------------------------- events
 
     def on_event(self, ev: Any) -> None:
+        if isinstance(ev, ConnectionEvent):
+            self.connected = ev.status == "connected"
+            for st in self.sym.values():
+                st.health.set_connected(self.connected)
+            if not self.running:
+                return
+            if not self.connected:
+                self.message = f"Exchange connection {ev.status}: no signals until it is back."
+                for st in self.sym.values():
+                    st.status = HealthStatus("disconnected", "exchange connection is down")
+                    st.last_scores, st.assessment = None, {}
+                    for d in st.dirs.values():
+                        d.state, d.sent = "idle", set()
+            self._publish(force=True)
+            return
         if not self.running:
             return
         if isinstance(ev, MarketInfoEvent) and ev.symbol in self.sym:
@@ -147,20 +183,30 @@ class PulseEngine:
         elif isinstance(ev, TickEvent) and ev.tick.symbol in self.sym:
             st = self.sym[ev.tick.symbol]
             st.feats.add_tick(ev.tick)
+            st.health.on_tick(ev.tick.ts_ms)
+            if st.last_bid == 0:
+                st.last_bid = st.last_ask = ev.tick.price
             self._on_price(ev.tick.symbol, ev.tick.price, ev.tick.ts_ms)
         elif isinstance(ev, BookEvent) and ev.symbol in self.sym:
             st = self.sym[ev.symbol]
-            st.feats.add_book(ev)
-            self._on_price(ev.symbol, ev.mid, ev.ts_ms)
+            st.health.on_book(ev.ts_ms, ev.synced, ev.seq)
+            st.book_seq = ev.seq
+            if ev.synced:
+                st.feats.add_book(ev)
+                st.last_bid, st.last_ask, st.last_bid_depth = ev.best_bid, ev.best_ask, ev.bid_depth_near
+                self._on_price(ev.symbol, ev.mid, ev.ts_ms)
+        elif isinstance(ev, BookSyncEvent) and ev.symbol in self.sym:
+            self.sym[ev.symbol].health.on_sync(ev.status, ev.detail)
         elif isinstance(ev, BarsEvent) and ev.timeframe_s == 60 and ev.symbol in self.sym:
             st = self.sym[ev.symbol]
             bars = {b.ts_ms: b for b in st.bars_1m}
             for b in ev.bars:
                 bars[b.ts_ms] = b
-            st.bars_1m = [bars[k] for k in sorted(bars)][-60:]
+            st.bars_1m = [bars[k] for k in sorted(bars)][-120:]
             closed = [b for b in st.bars_1m if b.closed][-14:]
             if closed:
                 st.feats.vol_pct = sum((b.high - b.low) / b.close * 100.0 for b in closed if b.close) / len(closed)
+            st.regime = classify(st.bars_1m)
         elif isinstance(ev, HeartbeatEvent):
             self._tick_clock(ev.ts_ms)
 
@@ -168,6 +214,13 @@ class PulseEngine:
         if now_ms - self._last_obs_ms >= self.cfg.obs_interval_s * 1000:
             self._last_obs_ms = now_ms
             self._observe_all(now_ms)
+        if now_ms - self._last_minute_ms >= 60_000:
+            self._last_minute_ms = now_ms
+            for m in self.modes.values():
+                m.record_equity(now_ms)
+                m.save()
+            self.tracker.flush(now_ms)
+            self._maybe_train(now_ms)
         self._publish()
 
     # ---------------------------------------------------------- observation
@@ -175,249 +228,282 @@ class PulseEngine:
     def _related_imb(self, symbol: str, now_ms: int) -> float | None:
         base = symbol.partition("/")[0]
         pref = ["BTC", "ETH"] if base not in ("BTC", "ETH") else (["ETH"] if base == "BTC" else ["BTC"])
-        for s, st in self.sym.items():
-            if s != symbol and s.partition("/")[0] in pref and st.feats.last_mid:
+        healthy = [(s, st) for s, st in self.sym.items() if s != symbol and st.feats.last_mid and st.status.status not in ("disconnected", "no_data", "stale_trades", "inactive")]
+        for s, st in healthy:
+            if s.partition("/")[0] in pref:
                 return st.feats.imbalance(now_ms)
-        for s, st in self.sym.items():
-            if s != symbol and st.feats.last_mid:
-                return st.feats.imbalance(now_ms)
+        for _s, st in healthy:
+            return st.feats.imbalance(now_ms)
         return None
 
     def _observe_all(self, now_ms: int) -> None:
         for symbol, st in self.sym.items():
+            st.health.observations = st.feats.observations
+            st.health.min_obs = self.cfg.min_obs
+            hs = st.health.evaluate(now_ms)
+            fresh = hs.status not in ("disconnected", "no_data", "stale_trades", "stale_book", "no_book", "book_unsynced", "inactive")
+            if not fresh:
+                # do not pollute the rolling distributions with stale readings
+                st.status, st.last_obs, st.last_scores, st.assessment = hs, None, None, {}
+                st.note = hs.detail
+                for d in st.dirs.values():
+                    d.state = "idle"
+                continue
             rel = self._related_imb(symbol, now_ms)
             obs = st.feats.observe(now_ms, rel)
             if obs is None:
+                st.status = HealthStatus("no_data", "no price yet")
                 continue
-            st.last_obs = obs
-            long_, short = st.feats.scores(obs, self.cfg.weights(), rel is not None)
-            st.last_scores = (long_, short)
-            if not st.feats.warmed_up:
-                st.state = "warming"
-                st.note = f"{st.feats.observations}/{st.feats.min_obs} observations"
+            st.health.observations = st.feats.observations
+            hs = st.health.evaluate(now_ms)
+            st.status = hs
+            if not hs.ok:
+                st.last_obs, st.last_scores, st.assessment = obs, None, {}
+                st.note = hs.detail
                 continue
-            self._record_research(symbol, st, obs, short, "short", now_ms)
-            self._step_long(symbol, st, obs, long_, now_ms)
+            sc = st.feats.scores(obs, self.weights, rel is not None)
+            if sc is None:  # cannot happen once health says ok, but never fall through to placeholders
+                st.last_scores = None
+                st.note = "INSUFFICIENT DATA"
+                continue
+            long_, short = sc
+            st.last_obs, st.last_scores = obs, (long_, short)
+            st.assessment = {"long": self._display_assessment(symbol, obs, long_, "long", st.regime.name), "short": self._display_assessment(symbol, obs, short, "short", st.regime.name)}
+            self._step(symbol, st, obs, short, "short", now_ms)
+            self._step(symbol, st, obs, long_, "long", now_ms)
 
-    # ------------------------------------------------------------ research
+    # ---------------------------------------------------------- detection
+
+    def _step(self, symbol: str, st: _SymState, obs: Observation, sc: Scores, direction: str, now_ms: int) -> None:
+        """Per-direction state machine: idle → monitor → prepared → (signal) → monitor.
+
+        A prepared episode may produce at most one *momentum* signal (flow accelerating
+        or PRS at the entry level before any breakout) and one *confirmed* signal (price
+        clears the absorption level with flow still in the direction). Each kind has its
+        own cooldown so an early momentum signal never hides the breakout behind it."""
+        cfg = self.cfg
+        d = st.dirs[direction]
+        if d.state in ("idle", "monitor"):
+            if sc.prs >= cfg.prepare_prs:
+                d.state = "prepared"
+                d.prepared_ms = now_ms
+                d.sent = set()
+                d.absorb_level = st.feats.recent_high_mid(now_ms, 10) if direction == "long" else st.feats.recent_low_mid(now_ms, 10)
+                if direction == "long":
+                    st.note = f"prepared: waiting for price above {d.absorb_level:,.2f} with buying still positive"
+            else:
+                d.state = "monitor" if sc.prs >= cfg.monitor_prs else "idle"
+            return
+        # prepared
+        if sc.prs < cfg.prepare_prs and now_ms - d.prepared_ms > cfg.prepared_ttl_s * 1000:
+            d.state = "monitor"
+            d.sent = set()
+            if direction == "long":
+                st.note = "pressure faded without confirmation"
+            return
+        if direction == "long":
+            confirmed = obs.mid > d.absorb_level and obs.imb60 > 0
+        else:
+            confirmed = obs.mid < d.absorb_level and obs.imb60 < 0
+        kind = "confirmed" if confirmed else "momentum" if (sc.acc >= MOMENTUM_TRIGGER or sc.prs >= cfg.enter_prs) else None
+        if kind is None or kind in d.sent or now_ms - d.last_event_ms[kind] < cfg.event_cooldown_s * 1000:
+            return
+        d.sent.add(kind)
+        d.last_event_ms[kind] = now_ms
+        self._signal(symbol, st, obs, sc, direction, now_ms, confirmed, d.absorb_level)
+        if confirmed:  # the release happened; a new episode needs new pressure
+            d.state = "monitor"
+            d.sent = set()
+
+    # ---------------------------------------------------------- recording
 
     def _vec(self, sc: Scores, obs: Observation) -> dict[str, float]:
-        return {"f": sc.f, "a": sc.a, "w": sc.w, "r": sc.r, "c": sc.c, "vol_pct": obs.vol_pct}
+        v = sc.as_dict()
+        v.update({"vol_pct": obs.vol_pct, "spread_pct": obs.spread_pct, "imbalance": obs.imb60})
+        return {k: float(v[k]) for k in KEYS}
 
-    def _exit_levels(self, obs: Observation) -> tuple[float, float]:
-        if self.cfg.adaptive and obs.vol_pct > 0:
-            stop = min(self.cfg.max_stop_pct, max(self.cfg.min_stop_pct, self.cfg.stop_vol_mult * obs.vol_pct))
-            return 2.0 * stop, stop
-        return self.cfg.target_pct, self.cfg.stop_pct
+    def _info(self, symbol: str) -> MarketInfo:
+        return self._infos.get(symbol) or MarketInfo(symbol, taker_fee=self.fallback_fee)
 
-    def _cost_pct(self, symbol: str) -> float:
-        fee = (self._infos.get(symbol) or MarketInfo(symbol, taker_fee=self.fallback_fee)).taker_fee
-        return 2.0 * (fee * 100.0 + self.slippage_pct)
+    def _fee_rate(self, symbol: str) -> float:
+        o = self.cfg.costs.fee_rate_override
+        return o if o is not None else (self._info(symbol).taker_fee or self.fallback_fee)
 
-    def _record(self, symbol: str, st: _SymState, obs: Observation, sc: Scores, direction: str, now_ms: int, status: str, reason: str, p: float, n: int, ev: float, target: float, stop: float) -> int:
+    def _reference_plan(self, symbol: str, obs: Observation, est: Estimate) -> tuple[float, float, float, Any]:
+        """(target, stop, expected move, costs) for a reference-size trade, used for the record and the display."""
+        c = self.cfg.costs
+        move = expected_move_pct(obs.vol_pct, c.hold_minutes_for_move, est.expected_mfe_pct if est.sufficient else None)
+        target, stop = plan_exits(obs.vol_pct, move, stop_vol_mult=self.cfg.stop_vol_mult, min_stop_pct=self.cfg.min_stop_pct, max_stop_pct=self.cfg.max_stop_pct,
+                                  target_capture=c.target_capture, max_target_pct=c.max_target_pct, adaptive=self.cfg.adaptive, fixed_target=self.cfg.target_pct, fixed_stop=self.cfg.stop_pct)
+        notional = min(self.cfg.budget * self.cfg.risk.risk_per_trade_pct / 100.0 / (stop / 100.0) if stop > 0 else 0.0, self.cfg.budget * self.cfg.risk.per_position_pct / 100.0)
+        costs = round_trip_costs(self._fee_rate(symbol), obs.spread_pct, notional, obs.bid_depth, obs.ask_depth, band_pct=c.impact_band_pct, base_slip_pct=c.base_slippage_pct)
+        return target, stop, move, costs
+
+    def _display_assessment(self, symbol: str, obs: Observation, sc: Scores, direction: str, regime: str) -> dict[str, Any]:
+        est = self.memory.estimate(direction, self._vec(sc, obs), regime)
+        target, stop, move, costs = self._reference_plan(symbol, obs, est)
+        a = assess(target, stop, costs, est.p_target if est.sufficient else None, min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
+        return {"prs": sc.prs, "target_pct": target, "stop_pct": stop, "expected_move_pct": move, "cost_pct": costs.total_pct, "fee_pct": costs.fee_pct, "spread_pct": costs.spread_pct,
+                "slippage_pct": costs.slippage_pct, "p_target": est.p_target, "ev_pct": a.ev_pct, "rr": a.rr_after_costs, "break_even_p": a.break_even_p, "verdict": a.verdict,
+                "reason": a.reason, "evidence": est.note, "n_effective": est.n_effective, "ci": (est.ci_low, est.ci_high)}
+
+    def _signal(self, symbol: str, st: _SymState, obs: Observation, sc: Scores, direction: str, now_ms: int, confirmed: bool, absorb: float) -> int:
         vec = self._vec(sc, obs)
+        est = self.memory.estimate(direction, vec, st.regime.name)
+        target, stop, move, costs = self._reference_plan(symbol, obs, est)
+        a = assess(target, stop, costs, est.p_target if est.sufficient else None, min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
+        status = "signal" if direction == "long" else "research"
+        features = {"raw_long": obs.raw_long, "raw_short": obs.raw_short, "scores": sc.as_dict(), "vol60_quote": obs.vol60_quote, "bid": obs.bid, "ask": obs.ask}
         eid = self.store.insert_pulse_event(
-            ts_ms=now_ms, exchange=self.exchange_id, symbol=symbol, direction=direction, prs=sc.prs, f=sc.f, a=sc.a, w=sc.w, r=sc.r, c=sc.c,
-            imbalance=obs.imb60, vol_pct=obs.vol_pct, spread_pct=obs.spread_pct, mid=obs.mid, target_pct=target, stop_pct=stop,
-            cost_pct=self._cost_pct(symbol), similar_n=n, similar_p=p, ev_pct=ev, status=status, reason=reason,
+            ts_ms=now_ms, exchange=self.exchange_id, symbol=symbol, direction=direction, prs=sc.prs, f=sc.f, a=sc.a, w=sc.w, r=sc.r, c=sc.c, acc=sc.acc, vpr=sc.vpr, sx=sc.sx, vx=sc.vx,
+            imbalance=obs.imb60, vol_pct=obs.vol_pct, spread_pct=obs.spread_pct, mid=obs.mid, bid=obs.bid, ask=obs.ask, bid_depth=obs.bid_depth, ask_depth=obs.ask_depth,
+            target_pct=target, stop_pct=stop, cost_pct=costs.total_pct, fee_pct=costs.fee_pct, spread_cost_pct=costs.spread_pct, slip_pct=costs.slippage_pct, expected_move_pct=move,
+            rr_after_costs=a.rr_after_costs or 0.0, similar_n=est.n, similar_eff=est.n_effective, similar_p=est.p_target or 0.0, p_stop=est.p_stop or 0.0, ci_low=est.ci_low or 0.0,
+            ci_high=est.ci_high or 0.0, ev_pct=a.ev_pct if a.ev_pct is not None else 0.0, evidence="sufficient" if est.sufficient else "insufficient", regime=st.regime.name,
+            health=st.status.status, confirmed=confirmed, status=status, reason=a.reason if direction == "long" else "bearish setup recorded for research (spot cannot short)",
+            features_json=json.dumps(features, default=float),
         )
-        self.pending.append(_Pending(eid, symbol, direction, obs.mid, target, stop, now_ms, self.cfg.max_hold_s * 1000, vec))
+        self.tracker.add(Pending(eid, symbol, direction, now_ms, obs.mid, target, stop, costs.total_pct, self.cfg.max_hold_s * 1000))
         self.events_recorded += 1
         self.store.set_setting("pulse.events_recorded", self.events_recorded)
-        st.last_event_ms[direction] = now_ms
-        self.emit(PulseEventRecord(eid, now_ms, symbol, direction, sc.prs, status, reason, "pending", None, None, n, p, ev))
+        decisions: dict[str, tuple[bool, str]] = {}
+        if direction == "long":
+            setup = Setup(symbol, direction, now_ms, obs, sc, st.regime.name, confirmed, st.status, vec, absorb, eid)
+            decisions = self._run_modes(setup, now_ms)
+            taken = [k for k, (ok, _r) in decisions.items() if ok]
+            st.note = ("entered by " + ", ".join(taken)) if taken else "signal recorded; " + next(iter(decisions.values()))[1][:80] if decisions else "signal recorded"
+        self.emit(PulseEventRecord(eid, now_ms, symbol, direction, sc.prs, status, a.reason, "pending", None, None, est.n_effective, est.p_target or 0.0, a.ev_pct or 0.0, st.regime.name, None, None, decisions))
         return eid
 
-    def _record_research(self, symbol: str, st: _SymState, obs: Observation, sc: Scores, direction: str, now_ms: int) -> None:
-        if sc.prs < self.cfg.prepare_prs or now_ms - st.last_event_ms[direction] < self.cfg.event_cooldown_s * 1000:
-            return
-        target, stop = self._exit_levels(obs)
-        p, n = self.memory.estimate(direction, self._vec(sc, obs))
-        ev = expected_value_pct(p, target, stop, self._cost_pct(symbol))
-        self._record(symbol, st, obs, sc, direction, now_ms, "research", "short setups are recorded, not traded (spot)", p, n, ev, target, stop)
+    def _run_modes(self, setup: Setup, now_ms: int) -> dict[str, tuple[bool, str]]:
+        info = self._info(setup.symbol)
+        cache: dict[int, Estimate] = {}
 
-    # ---------------------------------------------------------- long logic
+        def est_fn(min_n: int) -> Estimate:
+            if min_n not in cache:
+                cache[min_n] = self.memory.estimate(setup.direction, setup.vec, setup.regime, min_n=min_n)
+            return cache[min_n]
 
-    def _step_long(self, symbol: str, st: _SymState, obs: Observation, sc: Scores, now_ms: int) -> None:
-        if symbol in self.positions:
-            st.state = "entered"
-            return
-        cfg = self.cfg
-        if st.state in ("warming", "idle", "monitor"):
-            if sc.prs >= cfg.prepare_prs:
-                st.state = "prepared"
-                st.prepared_ms = now_ms
-                st.absorb_high = st.feats.recent_high_mid(now_ms, 10)
-                st.note = f"prepared: waiting for price above {st.absorb_high:,.2f} with PRS ≥ {cfg.enter_prs:g}"
-            else:
-                st.state = "monitor" if sc.prs >= cfg.monitor_prs else "idle"
-                st.note = ""
-            return
-        if st.state == "prepared":
-            if sc.prs < cfg.prepare_prs and now_ms - st.prepared_ms > cfg.prepared_ttl_s * 1000:
-                st.state = "monitor"
-                st.note = "pressure faded without confirmation"
-                return
-            if sc.prs >= cfg.enter_prs and obs.mid > st.absorb_high and obs.imb60 > 0:
-                if now_ms - st.last_event_ms["long"] < cfg.event_cooldown_s * 1000:
-                    return
-                self._try_enter(symbol, st, obs, sc, now_ms)
+        ml_p = None
+        if self.model is not None and self.model.usable:
+            like = dict(setup.vec)
+            like["regime"] = setup.regime
+            ml_p = self.model.p(like)
+        out: dict[str, tuple[bool, str]] = {}
+        for key, m in self.modes.items():
+            d = m.evaluate(setup, info, est_fn, ml_p, now_ms)
+            did = self.store.insert_decision(event_id=setup.event_id or 0, ts_ms=now_ms, mode=key, symbol=setup.symbol, direction=setup.direction, accepted=d.accepted, code=d.code, reason=d.reason)
+            if d.accepted:
+                res = m.enter(setup, d, info, did, now_ms)
+                if isinstance(res, Rejection):
+                    self.store.update_decision(did, accepted=False, code="risk_rejected", reason=res.reason)
+                    out[key] = (False, res.reason)
+                    continue
+            out[key] = (d.accepted, d.reason)
+        if any(ok for ok, _ in out.values()):
+            self._publish(force=True)
+        return out
 
-    def _try_enter(self, symbol: str, st: _SymState, obs: Observation, sc: Scores, now_ms: int) -> None:
-        cfg = self.cfg
-        target, stop = self._exit_levels(obs)
-        cost = self._cost_pct(symbol)
-        p, n = self.memory.estimate("long", self._vec(sc, obs))
-        ev = expected_value_pct(p, target, stop, cost)
-        reasons = []
-        if obs.spread_pct > cfg.max_spread_pct:
-            reasons.append(f"spread {obs.spread_pct:.3f}% above {cfg.max_spread_pct:g}%")
-        if now_ms < self.paused_until_ms:
-            reasons.append("paused after consecutive losses")
-        if self._daily_loss_hit():
-            reasons.append("daily loss limit reached")
-        if len(self.positions) >= cfg.max_positions:
-            reasons.append(f"already {len(self.positions)} open position(s)")
-        if target < cfg.min_target_cost_mult * cost:
-            reasons.append(f"expected move {target:.2f}% cannot cover costs {cost:.2f}% (market too quiet)")
-        if ev < cfg.ev_margin_pct and not cfg.research_mode:
-            reasons.append(f"EV {ev:+.3f}% below margin (p={p:.0%} from {n} similar; break-even {break_even_win_rate(target, stop, cost):.0%})")
-        if reasons:
-            self._record(symbol, st, obs, sc, "long", now_ms, "rejected", "; ".join(reasons), p, n, ev, target, stop)
-            st.state = "monitor"
-            st.note = "rejected: " + reasons[0]
-            return
-        # size: risk a fixed fraction of the budget per trade
-        risk_usd = cfg.budget * cfg.risk_per_trade_pct / 100.0
-        notional = risk_usd / (stop / 100.0)
-        price = obs.mid
-        info = self._infos.get(symbol) or MarketInfo(symbol, taker_fee=self.fallback_fee)
-        in_use = sum(p_.cost for p_ in self.positions.values())
-        ctx = RiskContext(self.cash, in_use, 0.0, 0.0, False, info, now_ms)
-        res = self.risk.approve(OrderIntent(symbol, "buy", notional / price, price, "pulse entry", price * (1 - stop / 100)), ctx)
-        if isinstance(res, Rejection):
-            self._record(symbol, st, obs, sc, "long", now_ms, "rejected", res.reason, p, n, ev, target, stop)
-            st.state = "monitor"
-            st.note = "rejected: " + res.reason
-            return
-        fill = self.executor.execute(res, price, now_ms)
-        assert fill is not None
-        cost_usd = fill.notional + fill.fee
-        self.cash -= cost_usd
-        eid = self._record(symbol, st, obs, sc, "long", now_ms, "entered", f"confirmed above {st.absorb_high:,.2f}; EV {ev:+.3f}% (p={p:.0%}, n={n})" + ("" if ev >= cfg.ev_margin_pct else " [research mode]"), p, n, ev, target, stop)
-        self.positions[symbol] = _Position(symbol, fill.amount, fill.price, cost_usd, fill.price * (1 - stop / 100), fill.price * (1 + target / 100), now_ms, eid)
-        self.store.insert_trade(mode=MODE, exchange=self.exchange_id, symbol=symbol, side="buy", ts_ms=now_ms, price=price, fill_price=fill.price, amount=fill.amount, fee=fill.fee, fee_currency=symbol.partition("/")[2], slippage=fill.slippage_pct, reason=f"pulse entry PRS {sc.prs:.0f}", status="filled")
-        st.state = "entered"
-        st.note = f"in position: stop {self.positions[symbol].stop:,.2f} target {self.positions[symbol].target:,.2f}"
-        log.info("PULSE BUY %s %.6f @ %.2f (PRS %.0f, EV %+.3f%%)", symbol, fill.amount, fill.price, sc.prs, ev)
-        self._publish(force=True)
+    # --------------------------------------------------------- price path
 
     def _on_price(self, symbol: str, price: float, now_ms: int) -> None:
-        pos = self.positions.get(symbol)
-        if pos is not None:
-            if price <= pos.stop:
-                self._exit(symbol, price, "stop")
-            elif price >= pos.target:
-                self._exit(symbol, price, "target")
-            elif now_ms - pos.entry_ms >= self.cfg.max_hold_s * 1000:
-                self._exit(symbol, price, "expired")
-        self._track_pending(symbol, price, now_ms)
+        st = self.sym[symbol]
+        self.tracker.on_price(symbol, price, now_ms)
+        info = self._info(symbol)
+        for m in self.modes.values():
+            closed = m.on_price(symbol, price, st.last_bid or price, st.last_ask or price, st.last_bid_depth, info, now_ms)
+            if closed:
+                self._publish(force=True)
 
-    def _exit(self, symbol: str, price: float, reason: str) -> None:
-        pos = self.positions.pop(symbol, None)
-        if pos is None:
+    def _on_resolved(self, p: Pending) -> None:
+        e = self.store.pulse_event(p.event_id)
+        if e:
+            row = row_from_event(e)
+            if row is not None:
+                self.memory.add(row)
+        self.emit(PulseEventRecord(p.event_id, p.start_ms, p.symbol, p.direction, 0.0, "", "", p.outcome(), p.mfe, p.mae, 0, 0.0, 0.0, "", p.net_pct(), p.first_hit))
+
+    # ------------------------------------------------------------------ ML
+
+    def _maybe_train(self, now_ms: int) -> None:
+        if self.store.count_pulse_events(resolved_only=True) < self.cfg.ml_min_events:
             return
-        now_ms = self._now_ms()
-        info = self._infos.get(symbol) or MarketInfo(symbol, taker_fee=self.fallback_fee)
-        ctx = RiskContext(self.cash, pos.cost, pos.cost, pos.units, False, info, now_ms)
-        res = self.risk.approve(OrderIntent(symbol, "sell", pos.units, price, f"pulse {reason}"), ctx)
-        if isinstance(res, Rejection):
-            log.error("pulse exit rejected: %s", res.reason)
+        last = self.model.report.trained_at_ms if self.model else self._last_train_ms
+        if now_ms - last < self.cfg.ml_retrain_minutes * 60_000:
             return
-        fill = self.executor.execute(res, price, now_ms)
-        assert fill is not None
-        proceeds = fill.notional - fill.fee
-        pnl = proceeds - pos.cost
-        self.cash += proceeds
-        self.trades += 1
-        self.trade_pnl += pnl
-        self._roll_day(now_ms)
-        self.day_realized += pnl
-        self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
-        if self.consecutive_losses >= self.cfg.max_consecutive_losses:
-            self.paused_until_ms = now_ms + self.cfg.pause_minutes * 60_000
-            self.message = f"Paused {self.cfg.pause_minutes} min after {self.consecutive_losses} consecutive losses."
-            self.store.audit("pulse", self.message, level="WARNING")
-        self.store.insert_trade(mode=MODE, exchange=self.exchange_id, symbol=symbol, side="sell", ts_ms=now_ms, price=price, fill_price=fill.price, amount=fill.amount, fee=fill.fee, fee_currency=symbol.partition("/")[2], slippage=fill.slippage_pct, reason=f"pulse {reason}", pnl=pnl, status="filled")
-        self.store.update_pulse_event(pos.event_id, trade_pnl=pnl)
-        self.sym[symbol].state = "monitor"
-        self.sym[symbol].note = f"exited ({reason}) P&L {pnl:+.2f}"
-        log.info("PULSE SELL %s %.6f @ %.2f (%s) pnl %+.2f", symbol, fill.amount, fill.price, reason, pnl)
+        self.train_now(now_ms)
+
+    def train_now(self, now_ms: int | None = None) -> str:
+        now_ms = now_ms or self._now_ms()
+        self._last_train_ms = now_ms
+        events = self.store.load_pulse_events(limit=100_000, resolved_only=True, ascending=True)
+        try:
+            model = mlmod.train(events)
+        except Exception as e:  # noqa: BLE001
+            self.ml_note = f"training failed: {e}"
+            self.store.set_setting("pulse.ml.note", self.ml_note)
+            return self.ml_note
+        rep = model.report
+        self.ml_note = rep.reason + (" — model retained for Mode C" if rep.improved else " — model NOT retained (no out-of-sample improvement)" if rep.ok else "")
+        if rep.ok and rep.improved:
+            self.model = model
+            self.store.set_setting("pulse.ml.model", model.to_json())
+        else:
+            self.model = None
+            self.store.set_setting("pulse.ml.model", "")
+        self.store.set_setting("pulse.ml.note", self.ml_note)
+        self.store.set_setting("pulse.ml.report", rep.as_dict())
+        self.store.audit("pulse", "ml trained", level="INFO", report=rep.as_dict())
         self._publish(force=True)
-
-    def _track_pending(self, symbol: str, price: float, now_ms: int) -> None:
-        done = []
-        for pe in self.pending:
-            if pe.symbol != symbol:
-                continue
-            sign = 1.0 if pe.direction == "long" else -1.0
-            move = sign * (price / pe.entry_mid - 1.0) * 100.0
-            pe.mfe = max(pe.mfe, move)
-            pe.mae = min(pe.mae, move)
-            outcome = None
-            if move >= pe.target_pct:
-                outcome = "target"
-            elif move <= -pe.stop_pct:
-                outcome = "stop"
-            elif now_ms - pe.start_ms >= pe.horizon_ms:
-                outcome = "expired"
-            if outcome:
-                self.store.update_pulse_event(pe.event_id, outcome=outcome, mfe_pct=pe.mfe, mae_pct=pe.mae, resolved_ts_ms=now_ms)
-                self.memory.add(pe.direction, pe.vec, outcome == "target")
-                self.emit(PulseEventRecord(pe.event_id, pe.start_ms, symbol, pe.direction, 0.0, "", "", outcome, pe.mfe, pe.mae, 0, 0.0, 0.0))
-                done.append(pe)
-        for pe in done:
-            self.pending.remove(pe)
+        return self.ml_note
 
     # ----------------------------------------------------------------- misc
-
-    def _roll_day(self, now_ms: int) -> None:
-        key = datetime.fromtimestamp(now_ms / 1000, self._tz).date().isoformat()
-        if key != self.day_key:
-            self.day_key = key
-            self.day_realized = 0.0
-
-    def _daily_loss_hit(self) -> bool:
-        self._roll_day(self._now_ms())
-        return self.day_realized <= -self.cfg.budget * self.cfg.daily_loss_pct / 100.0
 
     def _now_ms(self) -> int:
         return int(self.clock() * 1000)
 
     def equity(self) -> float:
-        return self.cash + sum(p.units * (self.sym[s].feats.last_mid or p.entry_px) for s, p in self.positions.items())
+        return sum(m.equity() for m in self.modes.values())
 
     def status(self) -> PulseStatusEvent:
+        now = self._now_ms()
         snaps = []
         for s, st in self.sym.items():
             o, sc = st.last_obs, st.last_scores
-            if o is None or sc is None:
-                snaps.append(PulseSnapshot(s, self._now_ms(), "warming" if self.running else "off", 50, 50, 50, 50, 50, 50, 50, 0.0, st.feats.last_mid, 0.0, st.feats.vol_pct, st.note))
-            else:
-                L, S = sc
-                snaps.append(PulseSnapshot(s, o.ts_ms, st.state if self.running else "off", L.prs, S.prs, L.f, L.a, L.w, L.r, L.c, o.imb60, o.mid, o.spread_pct, o.vol_pct, st.note))
-        # overall EV at current costs using the memory's long hit rate (or the prior)
-        sym0 = self.symbols[0] if self.symbols else ""
-        cost = self._cost_pct(sym0) if sym0 else 0.3
-        obs0 = self.sym[sym0].last_obs if sym0 and self.sym[sym0].last_obs else None
-        target, stop = self._exit_levels(obs0) if obs0 else (self.cfg.target_pct, self.cfg.stop_pct)
-        n_res = self.memory.resolved("long")
-        p = self.memory.hit_rate("long") if n_res >= self.cfg.min_similar else self.cfg.prior_p
+            valid = st.status.ok and sc is not None and o is not None
+            if not valid:
+                snaps.append(PulseSnapshot(s, now, st.state if self.running else "off", 0.0, 0.0, 0, 0, 0, 0, 0, 0.0, st.feats.last_mid, 0.0, st.feats.vol_pct, st.note, False,
+                                           st.status.status if self.running else "off", st.status.detail if self.running else "Pulse is not running", st.regime.name, {}, {}, {}, {},
+                                           st.last_bid, st.last_ask, st.health.trades_per_min(now), st.book_seq))
+                continue
+            L, S = sc
+            snaps.append(PulseSnapshot(s, o.ts_ms, st.state if self.running else "off", L.prs, S.prs, L.f, L.a, L.w, L.r, L.c, o.imb60, o.mid, o.spread_pct, o.vol_pct, st.note, True,
+                                       "ok", "", st.regime.name, L.as_dict(), S.as_dict(), st.assessment.get("long", {}), st.assessment.get("short", {}),
+                                       o.bid, o.ask, st.health.trades_per_min(now), st.book_seq))
+        modes = [PulseModeStatus(**m.status(now)) for m in self.modes.values()]
+        budget = sum(m.mode.budget for m in self.modes.values())
+        equity = sum(ms.equity for ms in modes)
+        trades = sum(ms.trades for ms in modes)
+        pnl = sum(ms.net_pnl for ms in modes)
+        # legacy summary line: reference costs for the first healthy coin
+        ref = next((st.assessment.get("long") for st in self.sym.values() if st.assessment.get("long")), None)
+        if ref:
+            stop, target, cost = ref["stop_pct"], ref["target_pct"], ref["cost_pct"]
+            p = ref["p_target"]
+        else:
+            stop, target, cost, p = self.cfg.stop_pct, self.cfg.target_pct, 0.0, None
+        ok = sum(1 for st in self.sym.values() if st.status.ok)
+        bad = [f"{s}: INSUFFICIENT DATA ({st.status.detail})" for s, st in self.sym.items() if not st.status.ok]
+        health_summary = f"{ok}/{len(self.sym)} coins with valid data" + ("; " + "; ".join(bad[:3]) if bad else "")
+        mem = {"events": self.events_recorded, "pending": len(self.tracker.pending), "resolved": self.memory.resolved(), "resolved_long": self.memory.resolved("long"),
+               "effective_long": self.memory.effective("long"), "hit_rate_long": self.memory.hit_rate("long"), "min_similar": self.cfg.min_similar}
+        mlinfo = {"available": mlmod.HAVE_LGBM, "backend": "lightgbm" if mlmod.HAVE_LGBM else "logistic (numpy)", "usable": bool(self.model and self.model.usable), "note": self.ml_note,
+                  "min_events": self.cfg.ml_min_events}
         return PulseStatusEvent(
-            self.running, self.cfg.budget, self.equity(), len(self.positions), self.events_recorded, self.memory.resolved(),
-            self.memory.hit_rate("long"), break_even_win_rate(target, stop, cost), expected_value_pct(p, target, stop, cost),
-            self.trades, self.trade_pnl, self.consecutive_losses, self.paused_until_ms, self.message, snaps,
-            stop, target, cost,
+            self.running, budget, equity, sum(ms.open_positions for ms in modes), self.events_recorded, self.memory.resolved(), self.memory.hit_rate("long"),
+            break_even_win_rate(target, stop, cost), expected_value_pct(p, target, stop, cost) if p is not None else 0.0, trades, pnl,
+            max((ms.consecutive_losses for ms in modes), default=0), max((ms.paused_until_ms for ms in modes), default=0), self.message, snaps, stop, target, cost,
+            self.connected, modes, mem, mlinfo, health_summary,
         )
 
     def _publish(self, force: bool = False) -> None:

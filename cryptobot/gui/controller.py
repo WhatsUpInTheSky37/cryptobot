@@ -13,6 +13,7 @@ from cryptobot.core.events import (
     BarsEvent,
     BudgetEvent,
     ConnectionEvent,
+    EWStatusEvent,
     EquityEvent,
     FillEvent,
     HeartbeatEvent,
@@ -71,6 +72,7 @@ class EngineController(QObject):
     market_info = Signal(object)  # MarketInfoEvent
     pulse_status = Signal(object)  # PulseStatusEvent
     pulse_event = Signal(object)  # PulseEventRecord
+    ew_status = Signal(object)  # EWStatusEvent
 
     def __init__(self, paths: AppPaths) -> None:
         super().__init__()
@@ -148,6 +150,15 @@ class EngineController(QObject):
     def pulse_stop(self) -> None:
         self._cmd(type="pulse_stop")
 
+    def pulse_train(self) -> None:
+        self._cmd(type="pulse_train")
+
+    def ew_start(self, config: dict, exchange: str = "binanceus") -> None:
+        self._cmd(type="ew_start", config=config, exchange=exchange)
+
+    def ew_stop(self) -> None:
+        self._cmd(type="ew_stop")
+
     def shutdown(self) -> None:
         if self._bridge is not None:
             self._bridge.stop()
@@ -199,3 +210,5 @@ class EngineController(QObject):
             self.pulse_status.emit(ev)
         elif isinstance(ev, PulseEventRecord):
             self.pulse_event.emit(ev)
+        elif isinstance(ev, EWStatusEvent):
+            self.ew_status.emit(ev)

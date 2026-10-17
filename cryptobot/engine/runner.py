@@ -20,6 +20,10 @@ from cryptobot.data.feed import MarketFeed
 from cryptobot.db.store import Store
 from cryptobot.engine.risk import RiskLimits
 from cryptobot.engine.trader import Trader
+from cryptobot.earlywarning.config import EWConfig
+from cryptobot.earlywarning.data import BinanceUSData, make_client
+from cryptobot.earlywarning.engine import EarlyWarningEngine
+from cryptobot.earlywarning.store import EWStore
 from cryptobot.pulse.config import PulseConfig
 from cryptobot.pulse.engine import PulseEngine
 from cryptobot.strategy.config import StrategyConfig
@@ -65,7 +69,7 @@ def engine_main(cmd_q, evt_q, config: dict[str, Any]) -> None:
 
 async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
     store = Store(Path(config["db_path"]))
-    holder: dict[str, Any] = {"trader": None, "pulse": None}
+    holder: dict[str, Any] = {"trader": None, "pulse": None, "ew": None, "ew_task": None, "ew_stop": None}
     base_tfs = tuple(config.get("timeframes_s", (1, 60, 300)))
 
     def emit_all(ev: Event) -> None:
@@ -180,6 +184,35 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
                 if holder["pulse"] is not None:
                     holder["pulse"].stop()
                     holder["pulse"] = None
+            elif kind == "ew_start":
+                if holder["ew"] is not None:
+                    holder["ew_stop"].set()
+                    try:
+                        await asyncio.wait_for(holder["ew_task"], timeout=15)
+                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                        holder["ew_task"].cancel()
+                ew_store = EWStore(Path(config["db_path"]).with_name("earlywarning.db"))
+                ew_cfg = EWConfig.model_validate(cmd.get("config") or {})
+                ew_store.set("config", ew_cfg.model_dump())
+                ex_id = cmd.get("exchange", "binanceus")
+                ew = EarlyWarningEngine(ew_store, evt_q.put, ex_id, ew_cfg, data=BinanceUSData(make_client(ex_id), ew_store))
+                holder["ew"], holder["ew_stop"] = ew, asyncio.Event()
+                holder["ew_task"] = asyncio.create_task(ew.run(holder["ew_stop"]), name="earlywarning")
+                log.info("early warning started on %s", ex_id)
+            elif kind == "ew_stop":
+                if holder["ew"] is not None:
+                    holder["ew_stop"].set()
+                    try:
+                        await asyncio.wait_for(holder["ew_task"], timeout=15)
+                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                        holder["ew_task"].cancel()
+                    holder["ew"] = None
+            elif kind == "pulse_train":
+                if holder["pulse"] is not None:
+                    note = holder["pulse"].train_now()
+                    evt_q.put(LogEvent("INFO", "pulse", f"ML: {note}", int(time.time() * 1000)))
+                else:
+                    evt_q.put(LogEvent("WARNING", "pulse", "Start Pulse before training the model.", int(time.time() * 1000)))
             elif kind == "set_limits":
                 if trader is not None:
                     trader.set_limits(RiskLimits.model_validate(cmd["limits"]))
@@ -191,6 +224,12 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
             trader.stop("engine shutting down")
         if holder["pulse"] is not None:
             holder["pulse"].stop()
+        if holder["ew"] is not None:
+            holder["ew_stop"].set()
+            try:
+                await asyncio.wait_for(holder["ew_task"], timeout=10)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                holder["ew_task"].cancel()
         stop.set()
         try:
             await asyncio.wait_for(feed_task, timeout=5)
