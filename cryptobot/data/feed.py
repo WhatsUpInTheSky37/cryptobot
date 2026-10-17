@@ -216,8 +216,7 @@ class MarketFeed:
         if self.order_book:
             native = self.exchange_id in WS_URLS and self.book_source in ("auto", "native")
             if native:
-                stream = BinanceDepthStream(ex, self.exchange_id, self.symbols, self._emit, book_interval_ms=self.book_interval_ms)
-                tasks.append(asyncio.create_task(stream.run(), name="depth-stream"))
+                tasks.append(asyncio.create_task(self._native_book(ex), name="depth-stream"))
             elif getattr(ex, "has", {}).get("watchOrderBook"):
                 tasks += [asyncio.create_task(self._watch_book(ex, s), name=f"book:{s}") for s in self.symbols]
         tasks.append(asyncio.create_task(self._heartbeat(ex), name="heartbeat"))
@@ -260,6 +259,24 @@ class MarketFeed:
                     changed = agg.add_tick(tick)
                     if changed:
                         self._publish(symbol, tf, changed)
+
+    async def _native_book(self, ex) -> None:
+        """Binance/Binance.US: the sequenced local book. If it fails for any reason (endpoint change, snapshot
+        refused, too many gaps) the trade stream must keep flowing, so fall back to ccxt's own book for the rest
+        of this connection and tell consumers the book was unsynced in between."""
+        try:
+            await BinanceDepthStream(ex, self.exchange_id, self.symbols, self._emit, book_interval_ms=self.book_interval_ms).run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("native depth stream failed (%s: %s); falling back to the exchange's order-book feed", type(e).__name__, e)
+            now = ex.milliseconds()
+            for s in self.symbols:
+                self._emit(BookSyncEvent(self.exchange_id, s, now, "unsynced", f"native depth stream failed: {e}"[:200]))
+        if getattr(ex, "has", {}).get("watchOrderBook"):
+            await asyncio.gather(*(self._watch_book(ex, s) for s in self.symbols))
+        else:
+            await asyncio.Event().wait()  # no order book at all on this connection; trades keep flowing
 
     async def _watch_book(self, ex, symbol: str) -> None:
         """Order book maintained by ccxt; we validate what we can see and resubscribe on persistent problems."""

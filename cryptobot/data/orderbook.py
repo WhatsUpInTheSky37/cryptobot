@@ -425,7 +425,10 @@ class BinanceDepthStream:
                 verify_task = asyncio.create_task(self._verify_loop())
                 try:
                     while True:
-                        msg = await asyncio.wait_for(ws.receive(), timeout=self.idle_timeout_s)
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=self.idle_timeout_s)
+                        except asyncio.TimeoutError:
+                            continue  # a quiet market sends no depth updates; the connection is kept alive by ping/pong
                         if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR):
                             raise ConnectionError(f"depth stream closed: {msg.type}")
                         if msg.type != aiohttp.WSMsgType.TEXT:

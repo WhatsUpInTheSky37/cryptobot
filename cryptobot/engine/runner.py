@@ -14,7 +14,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from cryptobot.core.events import AlertEvent, Event, LogEvent
+from cryptobot.core.events import AlertEvent, ConnectionEvent, Event, LogEvent
 from cryptobot.core.models import Mode
 from cryptobot.data.feed import MarketFeed
 from cryptobot.db.store import Store
@@ -69,11 +69,13 @@ def engine_main(cmd_q, evt_q, config: dict[str, Any]) -> None:
 
 async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
     store = Store(Path(config["db_path"]))
-    holder: dict[str, Any] = {"trader": None, "pulse": None, "ew": None, "ew_task": None, "ew_stop": None}
+    holder: dict[str, Any] = {"trader": None, "pulse": None, "ew": None, "ew_task": None, "ew_stop": None, "conn": None}
     base_tfs = tuple(config.get("timeframes_s", (1, 60, 300)))
 
     def emit_all(ev: Event) -> None:
         evt_q.put(ev)
+        if isinstance(ev, ConnectionEvent):
+            holder["conn"] = ev  # replayed to engines that start after the feed connected
         t: Trader | None = holder["trader"]
         if t is not None:
             try:
@@ -177,6 +179,8 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
                     holder["pulse"].stop()
                 pcfg = PulseConfig.model_validate(cmd.get("config") or {})
                 pu = PulseEngine(store, evt_q.put, market["exchange"], market["symbols"], pcfg, slippage_pct=float(cmd.get("slippage_pct", 0.05)))
+                if holder["conn"] is not None:
+                    pu.on_event(holder["conn"])  # the feed may already be connected; Pulse must not wait for an event that never comes
                 pu.start()
                 holder["pulse"] = pu
                 log.info("pulse started on %s", ", ".join(market["symbols"]))

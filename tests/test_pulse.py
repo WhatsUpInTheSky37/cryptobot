@@ -507,3 +507,21 @@ def test_stop_calls_close_all_and_records_sells():
     assert all(not m.positions for m in eng.modes.values())
     assert any("stopped" in t["reason"] for m in taken for t in store.load_trades(m.trade_mode))
     assert not statuses(ev)[-1].running
+
+
+def test_pulse_started_after_the_feed_connected_is_not_stuck_disconnected():
+    """The runner replays the last ConnectionEvent to a Pulse engine that starts later; without it every coin
+    would show 'exchange connection is down' forever even though the top bar says Connected."""
+    store = Store(":memory:")
+    events = []
+    clock = Clock(T0)
+    eng = PulseEngine(store, events.append, "coinbase", [S, B], cfg(), slippage_pct=0.05, clock=clock)
+    eng.on_event(ConnectionEvent("coinbase", "connected"))  # replayed before start
+    eng.start()
+    assert eng.connected
+    eng.on_event(MarketInfoEvent("coinbase", S, 0.0002, 0.0002, 0.0001, 5.0, 0.0001, 0.01))
+    eng.on_event(MarketInfoEvent("coinbase", B, 0.0002, 0.0002, 0.00001, 5.0, 0.00001, 0.01))
+    drive_neutral(eng, clock, 90)
+    st = statuses(events)[-1]
+    assert st.connected and all(s.health != "disconnected" for s in st.snapshots)
+    assert [s for s in st.snapshots if s.symbol == S][0].valid

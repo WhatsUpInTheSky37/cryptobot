@@ -77,11 +77,14 @@ def test_verify_symbols_exact_match_and_similar_names_are_not_substituted(synth)
     k, _s, _tr, rows = synth
     store = EWStore(":memory:")
     data = BinanceUSData(FakeBinanceUS(k, rows), store, sleep=lambda s: None)
-    recs = data.verify_symbols(["MXC/USD", "POND/USD", "FLUX/USD", "COMP/USD"])
+    recs = data.verify_symbols(["MXC/USD", "POND/USD", "FLUX/USD", "COMP/USD", "MXCX/USD"])
     by = {r["symbol"]: r for r in recs}
-    assert not by["MXC/USD"]["available"] and "MXCUSDT" in by["MXC/USD"]["note"] and "NOT the same" in by["MXC/USD"]["note"]
-    assert by["POND/USD"]["available"] and by["COMP/USD"]["available"]
-    assert not by["FLUX/USD"]["available"] and "BREAK" in by["FLUX/USD"]["note"]
+    # the exact pair is missing, but the SAME asset trades as MXC/USDT: recorded as a fallback, never silently
+    assert not by["MXC/USD"]["available"] and by["MXC/USD"]["fallback"] == "MXC/USDT" and "same asset trades as MXC/USDT" in by["MXC/USD"]["note"]
+    assert by["POND/USD"]["available"] and by["COMP/USD"]["available"] and "fallback" not in by["POND/USD"]
+    assert not by["FLUX/USD"]["available"] and "BREAK" in by["FLUX/USD"]["note"] and "fallback" not in by["FLUX/USD"]
+    # a look-alike name is a different asset: named as such, never used
+    assert not by["MXCX/USD"]["available"] and "NOT the same coin" in by["MXCX/USD"]["note"] and "fallback" not in by["MXCX/USD"]
     assert {m["symbol"] for m in store.markets()} == set(by)
 
 
@@ -103,7 +106,8 @@ def test_download_is_resumable_and_backs_off_on_weight(synth):
     assert data.download_agg_trades("POND/USD", "PONDUSD", days=1) == 0
     assert any(d["kind"] == "aggtrades" and "API key" in d["note"] for d in store.downloads())
     recs = download_all(data, ["POND/USD", "MXC/USD"], 2, progress=lambda m: None)
-    assert [r["available"] for r in recs] == [True, False]
+    assert [(r["symbol"], r["available"]) for r in recs] == [("POND/USD", True), ("MXC/USD", False), ("MXC/USDT", True)]
+    assert "substituted for MXC/USD" in [m for m in store.markets() if m["symbol"] == "MXC/USDT"][0]["note"]
 
 
 # ---------------------------------------------------------------- events

@@ -136,3 +136,57 @@ def test_book_validator_for_ccxt_books():
 
 def test_stream_name():
     assert stream_name("BTCUSDT") == "btcusdt@depth@100ms"
+
+
+# ----------------------------------------------------------- feed fallback
+
+
+async def test_feed_falls_back_to_exchange_book_when_native_stream_fails(monkeypatch):
+    """A failed native depth stream must not take the trade stream down: the feed keeps running and uses ccxt's book."""
+    import asyncio
+
+    from cryptobot.core.events import ConnectionEvent, TickEvent
+    from cryptobot.data import feed as feedmod
+    from tests.test_backfill import MIN, S, FakeExchange, trade
+
+    class BrokenStream:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self):
+            raise RuntimeError("endpoint refused")
+
+    monkeypatch.setattr(feedmod, "BinanceDepthStream", BrokenStream)
+    monkeypatch.setitem(feedmod.WS_URLS, "fake", "wss://example.invalid/stream")
+
+    class WithBook(FakeExchange):
+        has = {"watchOrderBook": True}
+
+        async def watch_trades(self, symbol):
+            if not self._batches:
+                await asyncio.sleep(3600)  # stay connected (the base fake drops the first session on purpose)
+            trades, advance = self._batches.pop(0)
+            self.now += advance
+            return trades
+
+        async def watch_order_book(self, symbol, limit=None):
+            await asyncio.sleep(0.01)
+            return {"bids": [[99.0, 1.0]], "asks": [[101.0, 1.0]], "nonce": 5}
+
+    FakeExchange.sessions = 0
+    start_now = 1000 * MIN + 500
+    script = {"now": start_now, "fetch_calls": [], "batches": [[([trade(1, start_now, 100.0)], 0), ([trade(2, start_now + 100, 100.5)], 0)]] + [[]]}
+    events = []
+    feed = feedmod.MarketFeed("fake", [S], events.append, timeframes_s=(1, 60), history_bars=10, exchange_factory=lambda _i: WithBook(script), max_backoff_s=0.01, heartbeat_s=10)
+    stop = asyncio.Event()
+    task = asyncio.create_task(feed.run(stop))
+    end = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < end and not any(isinstance(e, BookEvent) for e in events):
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    syncs = [e for e in events if isinstance(e, BookSyncEvent)]
+    assert syncs and syncs[0].status == "unsynced" and "native depth stream failed" in syncs[0].detail
+    assert any(isinstance(e, BookEvent) and e.best_bid == 99.0 and e.synced for e in events), "ccxt's book must take over"
+    assert any(isinstance(e, TickEvent) for e in events) and any(isinstance(e, ConnectionEvent) and e.status == "connected" for e in events)
+    assert sum(1 for e in events if isinstance(e, ConnectionEvent) and e.status == "reconnecting") == 0, "the book failure must not reconnect the feed"

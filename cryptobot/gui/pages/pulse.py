@@ -457,6 +457,16 @@ class PulsePage(QWidget):
     def _on_status(self, ev: PulseStatusEvent) -> None:
         self.start_btn.setEnabled(not ev.running)
         self.stop_btn.setEnabled(ev.running)
+        current = [s.symbol for s in ev.snapshots]
+        stale = [sym for sym in self.cards if sym not in current]
+        if stale:  # the market changed: rebuild the grid without the old coins
+            for sym in stale:
+                w = self.cards.pop(sym)
+                self.cards_box.removeWidget(w)
+                w.deleteLater()
+            for i, w in enumerate(self.cards.values()):
+                self.cards_box.removeWidget(w)
+                self.cards_box.addWidget(w, i // 2, i % 2)
         for s in ev.snapshots:
             if s.symbol not in self.cards:
                 card = _SymbolCard(s.symbol)

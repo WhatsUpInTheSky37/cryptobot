@@ -76,29 +76,44 @@ class BinanceUSData:
             out[str(s.get("symbol"))] = s
         return out
 
-    def verify_symbols(self, symbols: list[str]) -> list[dict[str, Any]]:
-        """Check exact symbols against exchangeInfo. Never substitutes a similarly named coin."""
+    def verify_symbols(self, symbols: list[str], *, quote_fallback: tuple[str, ...] = ("USDT", "USDC", "USD")) -> list[dict[str, Any]]:
+        """Check exact symbols against exchangeInfo. Never substitutes a similarly named coin.
+
+        When the exact pair is missing or not trading but the SAME base asset trades against
+        another allowed quote (e.g. MXC/USD is BREAK while MXC/USDT is TRADING, which is the
+        normal state of Binance.US since it lost USD rails), the record carries ``fallback``
+        with that pair; the report shows both so the substitution is never silent."""
         info = self.exchange_info()
         by_id = {k: v for k, v in info.items()}
+
+        def _perms(x: dict[str, Any]) -> list[str]:
+            return x.get("permissions") or [p for ps in (x.get("permissionSets") or []) for p in ps]
+
+        def _trading(x: dict[str, Any]) -> bool:
+            return str(x.get("status")) == "TRADING" and (("SPOT" in _perms(x)) or bool(x.get("isSpotTradingAllowed")))
+
         out = []
         for sym in symbols:
             base, _, quote = sym.partition("/")
             mid = f"{base}{quote}"
             s = by_id.get(mid)
-            similar = sorted(k for k in by_id if k != mid and (k.startswith(base) or base in k))[:5]  # any quote: MXC/USDT is not MXC/USD
+            similar = sorted(k for k, v in by_id.items() if k != mid and str(v.get("baseAsset")) != base and (base in k or str(v.get("baseAsset")) in base))[:5]
+            alts = [v for k, v in by_id.items() if k != mid and str(v.get("baseAsset")) == base and str(v.get("quoteAsset")) in quote_fallback and _trading(v)]
+            alts.sort(key=lambda v: quote_fallback.index(str(v["quoteAsset"])))
+            fallback = f"{alts[0]['baseAsset']}/{alts[0]['quoteAsset']}" if alts else None
             if s is None:
                 note = "not listed on Binance.US" + (f"; similarly named (NOT the same coin): {', '.join(similar)}" if similar else "")
                 rec = dict(symbol=sym, market_id=mid, status="MISSING", available=False, spot=False, base=base, quote=quote, note=note)
             else:
-                perms = s.get("permissions") or []
-                if not perms and s.get("permissionSets"):
-                    perms = [p for ps in s["permissionSets"] for p in ps]
-                spot = ("SPOT" in perms) or bool(s.get("isSpotTradingAllowed"))
+                spot = ("SPOT" in _perms(s)) or bool(s.get("isSpotTradingAllowed"))
                 status = str(s.get("status", "UNKNOWN"))
                 available = status == "TRADING" and spot
                 note = "" if available else f"status {status}, spot {'yes' if spot else 'no'}"
                 rec = dict(symbol=sym, market_id=mid, status=status, available=available, spot=spot, base=str(s.get("baseAsset", base)), quote=str(s.get("quoteAsset", quote)), note=note)
-            self.store.put_market(**rec)
+            if not rec["available"] and fallback:
+                rec["fallback"] = fallback
+                rec["note"] = (rec["note"] + "; " if rec["note"] else "") + f"same asset trades as {fallback} (TRADING): researched instead"
+            self.store.put_market(**{k: v for k, v in rec.items() if k != "fallback"})
             out.append(rec)
         return out
 
@@ -200,9 +215,19 @@ class BinanceUSData:
 def download_all(data: BinanceUSData, symbols: list[str], days: int, *, trades: bool = True, progress: Callable[[str], None] = log.info, max_trade_rows: int | None = None) -> list[dict[str, Any]]:
     """Phase 1: verify, then download 1m and 5m klines and aggregated trades for each available symbol."""
     recs = data.verify_symbols(symbols)
+    for r in list(recs):
+        if not r["available"] and r.get("fallback"):
+            fb = r["fallback"]
+            progress(f"{r['symbol']}: unavailable ({r['note']})")
+            if not any(x["symbol"] == fb for x in recs):
+                base, _, quote = fb.partition("/")
+                sub = dict(symbol=fb, market_id=f"{base}{quote}", status="TRADING", available=True, spot=True, base=base, quote=quote, note=f"substituted for {r['symbol']} ({r['status']}): same asset, different quote")
+                data.store.put_market(**sub)
+                recs.append(sub)
     for r in recs:
         if not r["available"]:
-            progress(f"{r['symbol']}: unavailable ({r['note']})")
+            if not r.get("fallback"):
+                progress(f"{r['symbol']}: unavailable ({r['note']})")
             continue
         for interval in ("1m", "5m"):
             n = data.download_klines(r["symbol"], r["market_id"], interval, days)
