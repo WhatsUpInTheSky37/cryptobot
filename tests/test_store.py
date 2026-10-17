@@ -25,3 +25,13 @@ def test_upsert_bars_is_idempotent_and_updates(tmp_path):
     assert store.last_closed_ts("kraken", "BTC/USD", 60) == 60_000
     assert store.load_bars("coinbase", "BTC/USD", 60) == []
     store.audit("test", "hello", x=1)
+
+
+def test_upsert_many_bars_in_one_call(tmp_path):
+    """A year of hourly candles (8,760 rows) used to exceed SQLite's bound-variable limit."""
+    store = Store(tmp_path / "t.db")
+    bars = [Bar("BTC/USDT", 3600, i * 3_600_000, 1, 2, 0.5, 1.5, 10, 3, True) for i in range(9000)]
+    assert store.upsert_bars("binanceus", bars) == 9000
+    assert len(store.load_bars("binanceus", "BTC/USDT", 3600, limit=20_000)) == 9000
+    assert store.upsert_bars("binanceus", bars[:1200]) == 1200  # idempotent across chunks
+    assert len(store.load_bars("binanceus", "BTC/USDT", 3600, limit=20_000)) == 9000

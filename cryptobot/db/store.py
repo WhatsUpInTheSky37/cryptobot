@@ -75,19 +75,22 @@ class Store:
         ]
         if not rows:
             return 0
+        # SQLite limits the number of bound variables per statement, so write in chunks.
+        chunk = 500
         with Session(self.engine) as s:
-            stmt = insert(BarRow).values(rows)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=[BarRow.exchange, BarRow.symbol, BarRow.timeframe_s, BarRow.ts_ms],
-                set_={
-                    "open": stmt.excluded.open,
-                    "high": stmt.excluded.high,
-                    "low": stmt.excluded.low,
-                    "close": stmt.excluded.close,
-                    "volume": stmt.excluded.volume,
-                },
-            )
-            s.execute(stmt)
+            for i in range(0, len(rows), chunk):
+                stmt = insert(BarRow).values(rows[i : i + chunk])
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[BarRow.exchange, BarRow.symbol, BarRow.timeframe_s, BarRow.ts_ms],
+                    set_={
+                        "open": stmt.excluded.open,
+                        "high": stmt.excluded.high,
+                        "low": stmt.excluded.low,
+                        "close": stmt.excluded.close,
+                        "volume": stmt.excluded.volume,
+                    },
+                )
+                s.execute(stmt)
             s.commit()
         return len(rows)
 

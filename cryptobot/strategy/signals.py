@@ -1,6 +1,8 @@
 """THE shared signal path. Backtests, TEST mode and BUY mode all call this and nothing else."""
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from cryptobot.strategy.base import BarArrays, warmup_index
@@ -21,7 +23,9 @@ def compute_target_exposure(config: StrategyConfig, bars: BarArrays) -> tuple[np
         if config.regime_gate:
             e = regime_gate(e, bars, cls.kind, config.adx_n, config.adx_threshold)
         parts.append(e)
-    exposure = np.nanmean(np.vstack(parts), axis=0) if len(parts) > 1 else parts[0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN rows during warm-up are expected
+        exposure = np.nanmean(np.vstack(parts), axis=0) if len(parts) > 1 else parts[0]
     # nanmean would hide a NaN from one strategy; require all to be warmed up.
     all_nan = np.any(np.isnan(np.vstack(parts)), axis=0)
     exposure = np.where(all_nan, np.nan, exposure)
