@@ -1,0 +1,243 @@
+"""Events the engine process sends to the GUI process. All picklable."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+from cryptobot.core.models import Bar, Tick
+
+ConnectionStatus = Literal[
+    "connecting", "connected", "reconnecting", "blocked", "error", "stopped"
+]
+
+
+@dataclass(slots=True)
+class ConnectionEvent:
+    exchange: str
+    status: ConnectionStatus
+    message: str = ""
+    attempt: int = 0
+    retry_in_s: float = 0.0
+
+
+@dataclass(slots=True)
+class TickEvent:
+    exchange: str
+    tick: Tick
+
+
+@dataclass(slots=True)
+class BarsEvent:
+    """Bars to upsert by open time. ``replace`` means discard what you had first."""
+
+    exchange: str
+    symbol: str
+    timeframe_s: int
+    bars: list[Bar] = field(default_factory=list)
+    replace: bool = False
+
+
+@dataclass(slots=True)
+class BookEvent:
+    """Order-book snapshot summary, at most once per second per symbol."""
+
+    exchange: str
+    symbol: str
+    ts_ms: int
+    best_bid: float
+    best_ask: float
+    bid_depth_near: float  # quote value of bids within 0.1% of mid
+    ask_depth_near: float
+    bid_depth_wide: float  # within 0.5% of mid
+    ask_depth_wide: float
+
+    @property
+    def mid(self) -> float:
+        return (self.best_bid + self.best_ask) / 2.0
+
+    @property
+    def spread_pct(self) -> float:
+        m = self.mid
+        return (self.best_ask - self.best_bid) / m * 100.0 if m else 0.0
+
+
+@dataclass(slots=True)
+class HeartbeatEvent:
+    exchange: str
+    ts_ms: int
+
+
+@dataclass(slots=True)
+class LogEvent:
+    level: str
+    logger: str
+    message: str
+    ts_ms: int
+
+
+Event = ConnectionEvent | TickEvent | BarsEvent | HeartbeatEvent | LogEvent
+
+
+# ---------------------------------------------------------------------------
+# Trading events (Milestone 3+)
+
+
+@dataclass(slots=True)
+class MarketInfoEvent:
+    exchange: str
+    symbol: str
+    taker_fee: float
+    maker_fee: float
+    min_amount: float
+    min_cost: float
+    amount_step: float
+    price_step: float
+
+
+@dataclass(slots=True)
+class PositionSnapshot:
+    symbol: str
+    mode: str
+    amount: float
+    entry_price: float
+    current_price: float
+    pnl: float
+    pnl_pct: float
+    stop: float | None
+    take_profit: float | None
+    entry_ts_ms: int
+    basis: float
+
+
+@dataclass(slots=True)
+class TraderStateEvent:
+    mode: str  # STOPPED | TEST | BUY
+    status: str  # stopped | starting | running | halted_daily | halted_drawdown
+    message: str = ""
+    exchange: str = ""
+    symbols: list[str] = field(default_factory=list)
+    strategy: str = ""
+    started_ms: int = 0
+    halted_until_ms: int = 0
+    next_decision_ms: int = 0
+
+
+@dataclass(slots=True)
+class BudgetEvent:
+    mode: str
+    allocated: float
+    in_use: float
+    available: float
+    cash: float
+    equity: float
+    today_pnl: float
+    peak: float
+    drawdown_pct: float
+    ts_ms: int
+
+
+@dataclass(slots=True)
+class PositionsEvent:
+    mode: str
+    positions: list[PositionSnapshot] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class FillEvent:
+    mode: str
+    ts_ms: int
+    symbol: str
+    side: str
+    price: float
+    amount: float
+    fee: float
+    reason: str
+    pnl: float | None = None
+    order_id: str | None = None
+    status: str = "filled"
+
+
+@dataclass(slots=True)
+class SignalEvent:
+    mode: str
+    symbol: str
+    ts_ms: int
+    exposure: float
+    text: str
+
+
+@dataclass(slots=True)
+class AlertEvent:
+    level: str  # info | warn | bad
+    title: str
+    message: str
+    ts_ms: int
+
+
+@dataclass(slots=True)
+class EquityEvent:
+    mode: str
+    ts_ms: int
+    equity: float
+
+
+# ---------------------------------------------------------------------------
+# Crypto Pulse (order-flow research engine)
+
+
+@dataclass(slots=True)
+class PulseSnapshot:
+    symbol: str
+    ts_ms: int
+    state: str  # off | warming | idle | monitor | prepared | entered
+    prs_long: float
+    prs_short: float
+    f: float
+    a: float
+    w: float
+    r: float
+    c: float
+    imbalance_60: float
+    mid: float
+    spread_pct: float
+    vol_pct: float
+    note: str = ""
+
+
+@dataclass(slots=True)
+class PulseStatusEvent:
+    running: bool
+    paper_budget: float
+    paper_equity: float
+    open_positions: int
+    events_recorded: int
+    events_resolved: int
+    hit_rate: float
+    required_win_rate: float
+    ev_pct: float
+    trades: int
+    trade_pnl: float
+    consecutive_losses: int
+    paused_until_ms: int
+    message: str
+    snapshots: list[PulseSnapshot] = field(default_factory=list)
+    stop_pct: float = 0.0
+    target_pct: float = 0.0
+    cost_pct: float = 0.0
+
+
+@dataclass(slots=True)
+class PulseEventRecord:
+    id: int
+    ts_ms: int
+    symbol: str
+    direction: str
+    prs: float
+    status: str  # entered | rejected | research
+    reason: str
+    outcome: str  # pending | target | stop | expired
+    mfe_pct: float | None
+    mae_pct: float | None
+    similar_n: int
+    similar_p: float
+    ev_pct: float

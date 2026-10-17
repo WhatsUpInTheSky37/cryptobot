@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+build/
+dist/
+*.spec
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
