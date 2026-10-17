@@ -330,6 +330,19 @@ class PulsePage(QWidget):
         self.cooldown.setValue(self.cfg.event_cooldown_s)
         self.cooldown.setToolTip("Minimum time between two recorded signals of the same kind on the same coin.")
         sf.addRow("Signal cooldown", self.cooldown)
+        self.stale = QSpinBox()
+        self.stale.setRange(30, 1800)
+        self.stale.setSuffix(" s")
+        self.stale.setValue(self.cfg.health.stale_trade_s)
+        self.stale.setToolTip("A coin with no public trade for this long shows INSUFFICIENT DATA. Thin exchanges (Binance.US) need a generous value; liquid ones (Coinbase, Kraken) can be strict.")
+        sf.addRow("Stale after no trade for", self.stale)
+        self.min_tpm = QDoubleSpinBox()
+        self.min_tpm.setRange(0.0, 100.0)
+        self.min_tpm.setSingleStep(0.5)
+        self.min_tpm.setSuffix(" trades/min")
+        self.min_tpm.setValue(self.cfg.health.min_trades_per_min)
+        self.min_tpm.setToolTip("Below this activity a market is excluded for a while. 0 disables the activity filter.")
+        sf.addRow("Exclude below", self.min_tpm)
         side.addWidget(sg)
         st_card, stl = _card()
         self.s_memory = QLabel("—")
@@ -435,8 +448,9 @@ class PulsePage(QWidget):
 
     def _config(self) -> PulseConfig:
         risk = self.cfg.risk.model_copy(update={"risk_per_trade_pct": self.risk.value(), "daily_loss_pct": self.daily.value(), "max_positions": self.maxpos.value()})
+        health = self.cfg.health.model_copy(update={"stale_trade_s": self.stale.value(), "min_trades_per_min": self.min_tpm.value()})
         self.cfg = self.cfg.model_copy(update={"budget": self.budget.value(), "risk_per_trade_pct": self.risk.value(), "daily_loss_pct": self.daily.value(),
-                                               "max_positions": self.maxpos.value(), "event_cooldown_s": self.cooldown.value(), "risk": risk})
+                                               "max_positions": self.maxpos.value(), "event_cooldown_s": self.cooldown.value(), "risk": risk, "health": health})
         self.cfg = PulseConfig.model_validate(self.cfg.model_dump())
         self.store.set_setting("pulse.config", self.cfg.model_dump())
         return self.cfg

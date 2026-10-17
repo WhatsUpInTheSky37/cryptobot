@@ -19,6 +19,19 @@ T0 = 1_760_000_000_000
 # ---------------------------------------------------------------- health
 
 
+def test_health_defaults_tolerate_a_thin_exchange():
+    """Binance.US quiet pairs print well under a trade a minute; the defaults must not exclude them outright."""
+    h = SymbolHealth(HealthConfig())
+    h.min_obs = 0
+    h.set_connected(True)
+    for i in range(6):
+        h.on_tick(T0 + i * 120_000)  # one trade every two minutes
+        h.on_book(T0 + i * 120_000, True, i)
+    now = T0 + 5 * 120_000 + 100_000
+    h.on_book(now, True, 9)
+    assert h.evaluate(now).ok
+
+
 def test_health_states_in_order():
     h = SymbolHealth(HealthConfig(stale_trade_s=60, stale_book_s=10, min_trades_per_min=5, activity_window_s=120, inactive_cooldown_s=300))
     h.min_obs = 10

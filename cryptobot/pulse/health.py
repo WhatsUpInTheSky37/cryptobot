@@ -64,10 +64,13 @@ class SymbolHealth:
             self.book_synced = False
 
     def trades_per_min(self, now_ms: int) -> float:
+        """Trades per minute over the activity window, measured from the first trade that is inside it."""
         keep = now_ms - self.cfg.activity_window_s * 1000
-        n = sum(1 for t in self._trade_times if t >= keep)
-        span_min = min(self.cfg.activity_window_s, max(1, (now_ms - (self._trade_times[0] if self._trade_times else now_ms)) / 1000)) / 60.0
-        return n / span_min if span_min > 0 else 0.0
+        inside = [t for t in self._trade_times if t >= keep]
+        if not inside:
+            return 0.0
+        span_min = min(self.cfg.activity_window_s, max(60, (now_ms - inside[0]) / 1000)) / 60.0
+        return len(inside) / span_min
 
     # -- verdict ------------------------------------------------------------
 

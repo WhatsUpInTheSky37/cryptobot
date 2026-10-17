@@ -201,7 +201,9 @@ def test_no_scores_without_data_and_insufficient_data_is_explicit():
 
 
 def test_stale_data_disconnect_and_unsynced_book_block_signals():
-    eng, ev, store, clock = make()
+    c = cfg()
+    c.health.stale_trade_s = 90
+    eng, ev, store, clock = make(c)
     drive_neutral(eng, clock, 90)
     assert [s for s in statuses(ev)[-1].snapshots if s.symbol == S][0].valid
     # trades stop arriving: stale after 90 s

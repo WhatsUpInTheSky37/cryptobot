@@ -37,10 +37,10 @@ OUTCOME_HORIZONS_MS: dict[str, int] = {
 
 
 class HealthConfig(BaseModel):
-    stale_trade_s: int = 90  # no public trade for this long -> stale
-    stale_book_s: int = 15  # no order-book update for this long -> stale
+    stale_trade_s: int = 240  # no public trade for this long -> stale (Binance.US prints well under one trade a minute on quiet pairs)
+    stale_book_s: int = 30  # no order-book update for this long -> stale
     activity_window_s: int = 300
-    min_trades_per_min: float = 2.0  # below this the market is "inactive" and excluded
+    min_trades_per_min: float = 0.5  # below this the market is "inactive" and excluded
     inactive_cooldown_s: int = 300  # stays excluded at least this long
     require_book: bool = True
 

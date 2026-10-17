@@ -495,6 +495,9 @@ class PulseEngine:
         ok = sum(1 for st in self.sym.values() if st.status.ok)
         bad = [f"{s}: INSUFFICIENT DATA ({st.status.detail})" for s, st in self.sym.items() if not st.status.ok]
         health_summary = f"{ok}/{len(self.sym)} coins with valid data" + ("; " + "; ".join(bad[:3]) if bad else "")
+        rates = [st.health.trades_per_min(now) for st in self.sym.values() if st.health.last_trade_ms]
+        if self.connected and rates and max(rates) < 2.0 and self.running:
+            health_summary += " · this exchange is thin (under 2 trades/min on every coin): order-flow scores need activity; Pulse is paper-only, so pick Coinbase or Kraken on the Market page for liquid data"
         mem = {"events": self.events_recorded, "pending": len(self.tracker.pending), "resolved": self.memory.resolved(), "resolved_long": self.memory.resolved("long"),
                "effective_long": self.memory.effective("long"), "hit_rate_long": self.memory.hit_rate("long"), "min_similar": self.cfg.min_similar}
         mlinfo = {"available": mlmod.HAVE_LGBM, "backend": "lightgbm" if mlmod.HAVE_LGBM else "logistic (numpy)", "usable": bool(self.model and self.model.usable), "note": self.ml_note,

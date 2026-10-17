@@ -138,6 +138,20 @@ def test_stream_name():
     assert stream_name("BTCUSDT") == "btcusdt@depth@100ms"
 
 
+def test_ssl_context_verifies_with_certifi_bundle():
+    """The packaged app has no system CA store; the websocket must verify against certifi like ccxt does."""
+    import ssl
+
+    import certifi
+
+    from cryptobot.data.orderbook import ssl_context
+
+    ctx = ssl_context()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    assert ctx.cert_store_stats()["x509_ca"] > 0
+    assert certifi.where()
+
+
 # ----------------------------------------------------------- feed fallback
 
 

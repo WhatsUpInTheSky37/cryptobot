@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -371,6 +372,17 @@ def stream_name(market_id: str, speed: str = "100ms") -> str:
     return f"{market_id.lower()}@depth@{speed}"
 
 
+def ssl_context() -> ssl.SSLContext:
+    """TLS context that verifies against certifi's bundle, like ccxt does. A packaged (PyInstaller) app has no
+    usable system CA store, so the default context fails with CERTIFICATE_VERIFY_FAILED."""
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001 - certifi missing: fall back to the system store
+        return ssl.create_default_context()
+
+
 class BinanceDepthStream:
     """Reads the combined diff-depth websocket and feeds a ``DepthSyncer``.
 
@@ -420,7 +432,7 @@ class BinanceDepthStream:
         self._ids = self._market_ids()
         url = f"{self.ws_url}?streams={'/'.join(self._ids)}"
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(url, heartbeat=20, max_msg_size=4 * 1024 * 1024) as ws:
+            async with session.ws_connect(url, heartbeat=20, max_msg_size=4 * 1024 * 1024, ssl=ssl_context()) as ws:
                 await self.syncer.start()
                 verify_task = asyncio.create_task(self._verify_loop())
                 try:
