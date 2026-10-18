@@ -108,3 +108,46 @@ async def fetch_history(
             break
         since = last_ts + tf_ms
     return merge_bars([], out)
+
+
+def resample_bars(bars: Sequence[Bar], timeframe_s: int) -> list[Bar]:
+    """Aggregate finer bars into ``timeframe_s`` bars (open time aligned to the bucket). A bucket is
+    closed only when every finer bar in it is closed and the bucket is complete."""
+    if not bars:
+        return []
+    src_tf = bars[0].timeframe_s
+    per = max(1, timeframe_s // src_tf)
+    out: dict[int, Bar] = {}
+    counts: dict[int, int] = {}
+    for b in sorted(bars, key=lambda b: b.ts_ms):
+        key = bucket_ms(b.ts_ms, timeframe_s)
+        cur = out.get(key)
+        if cur is None:
+            out[key] = Bar(b.symbol, timeframe_s, key, b.open, b.high, b.low, b.close, b.volume, b.trades, False)
+            counts[key] = 1
+        else:
+            cur.high = max(cur.high, b.high)
+            cur.low = min(cur.low, b.low)
+            cur.close = b.close
+            cur.volume += b.volume
+            cur.trades += b.trades
+            counts[key] += 1
+        if not b.closed:
+            out[key].closed = False
+            counts[key] = -10**9  # an open source bar keeps the bucket open
+        elif counts[key] >= per:
+            out[key].closed = True
+    return [out[k] for k in sorted(out)]
+
+
+def supported_source_timeframe(exchange: Any, timeframe_s: int) -> int | None:
+    """The timeframe to fetch for ``timeframe_s``: itself when the exchange offers it, else the largest
+    offered timeframe (>= 1 minute) that divides it, else None. Exchanges without a timeframe list are
+    assumed to offer everything."""
+    offered = getattr(exchange, "timeframes", None)
+    label = TIMEFRAME_LABELS.get(timeframe_s)
+    if not offered or label is None or label in offered:
+        return timeframe_s
+    by_label = {v: k for k, v in TIMEFRAME_LABELS.items()}
+    candidates = [by_label[lb] for lb in offered if lb in by_label and by_label[lb] >= 60 and timeframe_s % by_label[lb] == 0 and by_label[lb] < timeframe_s]
+    return max(candidates) if candidates else None

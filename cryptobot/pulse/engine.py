@@ -24,6 +24,7 @@ from cryptobot.core.events import (
     BookEvent,
     BookSyncEvent,
     ConnectionEvent,
+    SymbolDroppedEvent,
     HeartbeatEvent,
     MarketInfoEvent,
     PulseEventRecord,
@@ -199,6 +200,12 @@ class PulseEngine:
                 st.feats.add_book(ev)
                 st.last_bid, st.last_ask, st.last_bid_depth = ev.best_bid, ev.best_ask, ev.bid_depth_near
                 self._on_price(ev.symbol, ev.mid, ev.ts_ms)
+        elif isinstance(ev, SymbolDroppedEvent) and ev.symbol in self.sym:
+            st = self.sym[ev.symbol]
+            st.health.unlisted = ev.reason + " (check the spelling on the Pulse settings tab)"
+            st.status = st.health.evaluate(self._now_ms())
+            st.last_scores, st.assessment = None, {}
+            self._publish(force=True)
         elif isinstance(ev, BookSyncEvent) and ev.symbol in self.sym:
             self.sym[ev.symbol].health.on_sync(ev.status, ev.detail)
         elif isinstance(ev, BarsEvent) and ev.timeframe_s == 60 and ev.symbol in self.sym:

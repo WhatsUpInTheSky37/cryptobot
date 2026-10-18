@@ -64,6 +64,15 @@ class BookEvent:
 
 
 @dataclass(slots=True)
+class SymbolDroppedEvent:
+    """The feed could not watch this symbol (not listed on the exchange) and continues without it."""
+
+    exchange: str
+    symbol: str
+    reason: str
+
+
+@dataclass(slots=True)
 class BookSyncEvent:
     """Order-book synchronisation state for one symbol (snapshot, gap, resync, verified)."""
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1 — feed: unlisted coins are dropped, unsupported candle sizes are built locally
+
+- A coin the exchange does not list (a typo such as SHIB/USB) no longer kills the feed: it is dropped with a warning, the rest connect, and Pulse shows that coin as "unlisted" with the reason. The feed still stops when none of the coins exist.
+- Exchanges without a candle size the strategy needs (Coinbase has no 4h candles) no longer retry forever: history is fetched at the largest supported size that divides it and aggregated locally; if no size fits, history for that timeframe is skipped with one warning and bars are built from live trades.
+
 ## 0.5.0 — tuned from the first day of real data (paper only)
 
 What the first day showed: every Crypto Pulse trade on Binance.US lost (stops hit within seconds on thin alts whose spread was wider than the stop; expiries at a flat price; targets never reached because thirty similar setups from the same two hours looked like evidence), and the Early Warning research on the four seed coins was mostly noise on pairs too thin to trade. Changes:

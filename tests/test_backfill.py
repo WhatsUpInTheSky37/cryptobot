@@ -228,3 +228,68 @@ async def test_feed_reports_unknown_symbol():
     statuses = [e.status for e in events if isinstance(e, ConnectionEvent)]
     assert statuses == ["connecting", "error", "stopped"]
     assert "NOPE/USD" in [e for e in events if isinstance(e, ConnectionEvent)][1].message
+
+
+async def test_feed_drops_an_unlisted_symbol_and_keeps_the_rest():
+    from cryptobot.core.events import SymbolDroppedEvent
+
+    FakeExchange.sessions = 0
+    events = []
+    feed = MarketFeed("coinbase", [S, "SHIB/USB"], events.append, exchange_factory=lambda _i: FakeExchange({"now": 1000 * MIN + 500, "fetch_calls": [], "batches": [[], []]}), max_backoff_s=0.01)
+    stop = asyncio.Event()
+    task = asyncio.create_task(feed.run(stop))
+    for _ in range(200):
+        if any(isinstance(e, ConnectionEvent) and e.status == "connected" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    dropped = [e for e in events if isinstance(e, SymbolDroppedEvent)]
+    assert [d.symbol for d in dropped] == ["SHIB/USB"] and "does not list SHIB/USB" in dropped[0].reason
+    assert feed.symbols == [S]
+    assert any(isinstance(e, ConnectionEvent) and e.status == "connected" for e in events), "the feed connected without the bad coin"
+
+
+def test_resample_bars_builds_four_hour_candles_from_hourly_ones():
+    from cryptobot.data.backfill import resample_bars, supported_source_timeframe
+
+    H = 3_600_000
+    hourly = [Bar(S, 3600, i * H, 10 + i, 12 + i, 9 + i, 11 + i, 1.0, 5, closed=True) for i in range(9)]
+    hourly[-1].closed = False
+    four = resample_bars(hourly, 14_400)
+    assert [b.ts_ms for b in four] == [0, 4 * H, 8 * H] and all(b.timeframe_s == 14_400 for b in four)
+    first = four[0]
+    assert (first.open, first.high, first.low, first.close, first.volume, first.trades) == (10, 15, 9, 14, 4.0, 20)
+    assert first.closed and four[1].closed and not four[2].closed, "the last bucket is incomplete and its source bar is open"
+
+    class Coinbase:
+        timeframes = {"1m": 1, "5m": 1, "15m": 1, "30m": 1, "1h": 1, "2h": 1, "6h": 1, "1d": 1}
+
+    class NoList:
+        pass
+
+    assert supported_source_timeframe(Coinbase(), 14_400) == 3_600  # 4h from the largest divisor the app knows how to label (1h; 2h is not in the table)
+    assert supported_source_timeframe(Coinbase(), 3_600) == 3_600
+    assert supported_source_timeframe(NoList(), 14_400) == 14_400
+    assert supported_source_timeframe(Coinbase(), 60) == 60
+
+
+async def test_feed_fetches_a_supported_candle_size_and_resamples():
+    class Coinbase(FakeExchange):
+        timeframes = {"1m": 1, "1h": 1}
+
+    FakeExchange.sessions = 0
+    events = []
+    feed = MarketFeed("coinbase", [S], events.append, timeframes_s=(1, 60, 14_400), history_bars=3,
+                      exchange_factory=lambda _i: Coinbase({"now": 1000 * MIN + 500, "fetch_calls": [], "batches": [[], []]}), max_backoff_s=0.01)
+    stop = asyncio.Event()
+    task = asyncio.create_task(feed.run(stop))
+    for _ in range(200):
+        if any(isinstance(e, ConnectionEvent) and e.status == "connected" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    labels = {tf for e in events if isinstance(e, BarsEvent) for tf in [e.timeframe_s]}
+    assert 14_400 in labels, "4h bars were published although the exchange has no 4h candles"
+    assert all(b.timeframe_s == 14_400 for e in events if isinstance(e, BarsEvent) and e.timeframe_s == 14_400 for b in e.bars)

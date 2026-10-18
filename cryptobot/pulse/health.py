@@ -11,7 +11,7 @@ INSUFFICIENT = "INSUFFICIENT DATA"
 
 @dataclass(frozen=True)
 class HealthStatus:
-    status: str  # ok | disconnected | no_data | stale_trades | no_book | book_unsynced | stale_book | inactive | insufficient_data
+    status: str  # ok | unlisted | disconnected | no_data | stale_trades | no_book | book_unsynced | stale_book | inactive | insufficient_data
     detail: str
 
     @property
@@ -37,6 +37,7 @@ class SymbolHealth:
         self._trade_times: deque[int] = deque()
         self.inactive_until_ms = 0
         self.sync_detail = ""
+        self.unlisted = ""  # set when the exchange does not list the symbol: terminal until Pulse is restarted with other coins
 
     # -- inputs -------------------------------------------------------------
 
@@ -77,6 +78,8 @@ class SymbolHealth:
 
     def evaluate(self, now_ms: int) -> HealthStatus:
         c = self.cfg
+        if self.unlisted:
+            return HealthStatus("unlisted", self.unlisted)
         if not self.connected:
             return HealthStatus("disconnected", "exchange connection is down")
         if self.last_trade_ms == 0:

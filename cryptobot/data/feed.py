@@ -17,6 +17,7 @@ import ccxt.pro as ccxtpro
 
 from cryptobot.core.bars import TIMEFRAME_LABELS, BarAggregator
 from cryptobot.core.events import (
+    SymbolDroppedEvent,
     BarsEvent,
     BookSyncEvent,
     ConnectionEvent,
@@ -26,7 +27,7 @@ from cryptobot.core.events import (
     TickEvent,
 )
 from cryptobot.core.models import Bar, Tick
-from cryptobot.data.backfill import fetch_history, plan_backfill
+from cryptobot.data.backfill import fetch_history, plan_backfill, resample_bars, supported_source_timeframe
 from cryptobot.data.orderbook import WS_URLS, BinanceDepthStream, BookValidator, summarize_book
 
 __all__ = ["MarketFeed", "FeedFatal", "is_geo_block", "summarize_book"]
@@ -89,6 +90,7 @@ class MarketFeed:
             s: {tf: BarAggregator(s, tf) for tf in self.timeframes_s} for s in self.symbols
         }
         self._last_closed: dict[tuple[str, int], int] = {}
+        self._tf_warned: set[tuple[str, int]] = set()
         self._seen: dict[str, tuple[deque[str], set[str]]] = {
             s: (deque(maxlen=4000), set()) for s in self.symbols
         }
@@ -159,10 +161,17 @@ class MarketFeed:
     # -- steps --------------------------------------------------------------
 
     def _check_symbols(self, ex) -> None:
+        """Drop symbols the exchange does not list and carry on with the rest; fatal only when none is left."""
         markets = getattr(ex, "markets", None) or {}
         missing = [s for s in self.symbols if s not in markets]
-        if missing:
+        if not missing:
+            return
+        if len(missing) == len(self.symbols):
             raise FeedFatal(f"{self.exchange_id} does not list {', '.join(missing)}")
+        log.warning("%s does not list %s: continuing without them", self.exchange_id, ", ".join(missing))
+        self.symbols = [s for s in self.symbols if s not in missing]
+        for s in missing:
+            self._emit(SymbolDroppedEvent(self.exchange_id, s, f"{self.exchange_id} does not list {s}"))
 
     def _emit_market_info(self, ex) -> None:
         markets = getattr(ex, "markets", None) or {}
@@ -204,7 +213,18 @@ class MarketFeed:
                 since, limit = plan_backfill(
                     self._last_closed.get((symbol, tf)), now, tf, default_bars=self.history_bars
                 )
-                bars = await fetch_history(ex, symbol, tf, since, limit)
+                src = supported_source_timeframe(ex, tf)
+                if src is None:
+                    if (symbol, tf) not in self._tf_warned:
+                        self._tf_warned.add((symbol, tf))
+                        log.warning("%s offers no candle size that builds %s bars; %s history for %s comes from live trades only",
+                                    self.exchange_id, TIMEFRAME_LABELS[tf], TIMEFRAME_LABELS[tf], symbol)
+                    continue
+                if src == tf:
+                    bars = await fetch_history(ex, symbol, tf, since, limit)
+                else:
+                    # e.g. Coinbase has no 4h candles: fetch 1h and build the 4h bars here
+                    bars = resample_bars(await fetch_history(ex, symbol, src, since, limit * (tf // src)), tf)
                 if not bars:
                     continue
                 self._publish(symbol, tf, bars)
