@@ -3,7 +3,7 @@ import asyncio
 import ccxt
 import pytest
 
-from cryptobot.core.events import BarsEvent, ConnectionEvent
+from cryptobot.core.events import BarsEvent, BookEvent, ConnectionEvent, TickEvent
 from cryptobot.core.models import Bar
 from cryptobot.data.backfill import fetch_history, find_gaps, merge_bars, plan_backfill
 from cryptobot.data.feed import MarketFeed, is_geo_block
@@ -293,3 +293,48 @@ async def test_feed_fetches_a_supported_candle_size_and_resamples():
     labels = {tf for e in events if isinstance(e, BarsEvent) for tf in [e.timeframe_s]}
     assert 14_400 in labels, "4h bars were published although the exchange has no 4h candles"
     assert all(b.timeframe_s == 14_400 for e in events if isinstance(e, BarsEvent) and e.timeframe_s == 14_400 for b in e.bars)
+
+
+async def test_feed_batches_subscriptions_when_the_exchange_allows():
+    class Batched(FakeExchange):
+        has = {"watchTradesForSymbols": True, "watchOrderBookForSymbols": True, "watchOrderBook": True}
+
+        def __init__(self, script):
+            super().__init__(script)
+            self.markets = {S: {}, "ETH/USD": {}}
+
+        async def watch_trades_for_symbols(self, symbols):
+            self.batched_calls = getattr(self, "batched_calls", 0) + 1
+            trades = await self.watch_trades(symbols[0])
+            return [dict(t, symbol=symbols[i % len(symbols)]) for i, t in enumerate(trades)]
+
+        async def watch_order_book_for_symbols(self, symbols, limit=None):
+            await asyncio.sleep(0.01)
+            return {"symbol": symbols[0], "bids": [[1.0, 5.0]], "asks": [[1.1, 5.0]], "nonce": 1}
+
+    FakeExchange.sessions = 0
+    now = 1000 * MIN + 500
+    script = {"now": now, "fetch_calls": [], "batches": [[([trade(1, now, 1.0), trade(2, now, 1.1)], 10)], []]}
+    events = []
+    feed = MarketFeed("coinbase", [S, "ETH/USD"], events.append, exchange_factory=lambda _i: Batched(script), max_backoff_s=0.01)
+    stop = asyncio.Event()
+    task = asyncio.create_task(feed.run(stop))
+    for _ in range(300):
+        if sum(1 for e in events if isinstance(e, TickEvent)) >= 2 and any(isinstance(e, BookEvent) for e in events):
+            break
+        await asyncio.sleep(0.01)
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    ticks = [e for e in events if isinstance(e, TickEvent)]
+    assert {t.tick.symbol for t in ticks} == {S, "ETH/USD"}, "trades from one subscription are routed to their own symbols"
+    assert any(isinstance(e, BookEvent) and e.symbol == S for e in events)
+    assert not any(isinstance(e, ConnectionEvent) and e.status == "error" for e in events)
+
+
+def test_plan_pulse_feed_shares_extends_or_owns():
+    from cryptobot.engine.runner import plan_pulse_feed
+
+    market = ["BTC/USD", "ETH/USD", "SOL/USD"]
+    assert plan_pulse_feed("coinbase", ["BTC/USD", "SOL/USD"], "coinbase", market) == ("shared", [])
+    assert plan_pulse_feed("coinbase", ["BTC/USD", "SHIB/USD"], "coinbase", market) == ("extra", ["SHIB/USD"])
+    assert plan_pulse_feed("kraken", ["BTC/USD"], "coinbase", market) == ("own", ["BTC/USD"])

@@ -14,7 +14,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from cryptobot.core.events import AlertEvent, ConnectionEvent, Event, LogEvent
+from cryptobot.core.events import AlertEvent, ConnectionEvent, Event, HeartbeatEvent, LogEvent
 from cryptobot.core.models import Mode
 from cryptobot.data.feed import MarketFeed
 from cryptobot.db.store import Store
@@ -65,6 +65,15 @@ def engine_main(cmd_q, evt_q, config: dict[str, Any]) -> None:
     except Exception:  # noqa: BLE001
         log.exception("engine crashed")
         raise
+
+
+def plan_pulse_feed(p_ex: str, p_syms: list[str], m_ex: str, m_syms: list[str]) -> tuple[str, list[str]]:
+    """How Pulse gets its data: "shared" (same exchange, every coin already on the Market feed), "extra"
+    (same exchange, a second connection only for the coins the Market feed lacks) or "own" (another exchange)."""
+    if p_ex != m_ex:
+        return "own", list(p_syms)
+    extra = [s for s in p_syms if s not in m_syms]
+    return ("extra", extra) if extra else ("shared", [])
 
 
 async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
@@ -192,26 +201,33 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
                 pcfg = PulseConfig.model_validate(cmd.get("config") or {})
                 p_ex = cmd.get("exchange") or market["exchange"]
                 p_syms = list(cmd.get("symbols") or market["symbols"])
-                own_feed = (p_ex, p_syms) != (market["exchange"], list(market["symbols"]))
+                plan, feed_syms = plan_pulse_feed(p_ex, p_syms, market["exchange"], list(market["symbols"]))
                 pu = PulseEngine(store, evt_q.put, p_ex, p_syms, pcfg, slippage_pct=float(cmd.get("slippage_pct", 0.05)))
-                if own_feed:
+                if plan != "shared":
                     # Pulse is paper-only and needs no key: it may watch a liquid exchange while the trader stays on another.
-                    # Its feed's events go to the Pulse engine only, never to the Market page or the trader.
-                    def pulse_emit(ev: Event, _pu=pu) -> None:
+                    # Its feed's events go to the Pulse engine only, never to the Market page or the trader. On the same
+                    # exchange it subscribes only to the coins the main feed lacks: a second connection with the same
+                    # subscriptions is what trips Coinbase's rate limit.
+                    extra_only = plan == "extra"
+
+                    def pulse_emit(ev: Event, _pu=pu, _extra=extra_only) -> None:
+                        if _extra and isinstance(ev, (ConnectionEvent, HeartbeatEvent)):
+                            return  # the main feed's connection and clock drive Pulse; this feed only adds coins
                         try:
                             _pu.on_event(ev)
                         except Exception:  # noqa: BLE001
                             log.exception("pulse failed on %s", type(ev).__name__)
 
-                    pfeed = MarketFeed(p_ex, p_syms, pulse_emit, timeframes_s=(1, 60), history_bars=120)
+                    pfeed = MarketFeed(p_ex, feed_syms, pulse_emit, timeframes_s=(1, 60), history_bars=120)
                     holder["pulse_feed_stop"] = asyncio.Event()
                     holder["pulse_feed_task"] = asyncio.create_task(pfeed.run(holder["pulse_feed_stop"]), name="pulse-feed")
-                    pu.own_feed = True
-                elif holder["conn"] is not None:
+                    pu.own_feed = not extra_only
+                if plan != "own" and holder["conn"] is not None:
                     pu.on_event(holder["conn"])  # the main feed may already be connected; Pulse must not wait for an event that never comes
                 pu.start()
                 holder["pulse"] = pu
-                log.info("pulse started on %s %s%s", p_ex, ", ".join(p_syms), " (own feed)" if own_feed else "")
+                log.info("pulse started on %s %s (%s)", p_ex, ", ".join(p_syms),
+                         {"shared": "sharing the Market feed", "extra": "Market feed plus its own for " + ", ".join(feed_syms), "own": "own feed"}[plan])
             elif kind == "pulse_stop":
                 if holder["pulse"] is not None:
                     holder["pulse"].stop()

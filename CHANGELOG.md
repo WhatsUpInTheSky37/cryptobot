@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.2 — one subscription per channel on Coinbase; Pulse shares the Market feed on the same exchange
+
+- Exchanges that accept a multi-symbol subscription (Coinbase, Kraken) now get one subscribe message per channel instead of one per coin per channel. Two connections subscribing 20 coins each, one message at a time, is what produced Coinbase's "rate limit exceeded" and the keepalive timeouts that followed every reconnect.
+- When Pulse runs on the same exchange as the Market page it shares the Market feed when every Pulse coin is already on it, and otherwise opens a second connection only for the coins the Market feed lacks. A different exchange still gets its own feed.
+
 ## 0.5.1 — feed: unlisted coins are dropped, unsupported candle sizes are built locally
 
 - A coin the exchange does not list (a typo such as SHIB/USB) no longer kills the feed: it is dropped with a warning, the rest connect, and Pulse shows that coin as "unlisted" with the reason. The feed still stops when none of the coins exist.

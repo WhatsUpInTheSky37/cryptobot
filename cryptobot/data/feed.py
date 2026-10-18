@@ -232,12 +232,20 @@ class MarketFeed:
                 agg.seed(bars[-1])
 
     async def _watch(self, ex, stop: asyncio.Event) -> None:
-        tasks = [asyncio.create_task(self._watch_symbol(ex, s), name=f"watch:{s}") for s in self.symbols]
+        has = getattr(ex, "has", None) or {}
+        # one subscription per channel for every symbol where the exchange allows it (Coinbase, Kraken):
+        # a subscribe message per symbol per channel is what trips Coinbase's "rate limit exceeded"
+        if len(self.symbols) > 1 and has.get("watchTradesForSymbols"):
+            tasks = [asyncio.create_task(self._watch_trades_batched(ex), name="watch:all")]
+        else:
+            tasks = [asyncio.create_task(self._watch_symbol(ex, s), name=f"watch:{s}") for s in self.symbols]
         if self.order_book:
             native = self.exchange_id in WS_URLS and self.book_source in ("auto", "native")
             if native:
                 tasks.append(asyncio.create_task(self._native_book(ex), name="depth-stream"))
-            elif getattr(ex, "has", {}).get("watchOrderBook"):
+            elif len(self.symbols) > 1 and has.get("watchOrderBookForSymbols"):
+                tasks.append(asyncio.create_task(self._watch_books_batched(ex), name="book:all"))
+            elif has.get("watchOrderBook"):
                 tasks += [asyncio.create_task(self._watch_book(ex, s), name=f"book:{s}") for s in self.symbols]
         tasks.append(asyncio.create_task(self._heartbeat(ex), name="heartbeat"))
         stopper = asyncio.create_task(stop.wait(), name="stop")
@@ -254,31 +262,68 @@ class MarketFeed:
                 t.cancel()
             await asyncio.gather(*tasks, stopper, return_exceptions=True)
 
-    async def _watch_symbol(self, ex, symbol: str) -> None:
+    def _ingest_trade(self, ex, symbol: str, t: dict) -> None:
         aggs = self._aggs[symbol]
         order, seen = self._seen[symbol]
+        tid = t.get("id")
+        if tid is not None:
+            tid = str(tid)
+            if tid in seen:
+                return
+            if len(order) == order.maxlen:
+                seen.discard(order[0])
+            order.append(tid)
+            seen.add(tid)
+        ts = t.get("timestamp") or ex.milliseconds()
+        price = t.get("price")
+        if price is None:
+            return
+        tick = Tick(symbol, int(ts), float(price), float(t.get("amount") or 0.0), tid, t.get("side"))
+        self._emit(TickEvent(self.exchange_id, tick))
+        for tf, agg in aggs.items():
+            changed = agg.add_tick(tick)
+            if changed:
+                self._publish(symbol, tf, changed)
+
+    async def _watch_symbol(self, ex, symbol: str) -> None:
         while True:
-            trades = await ex.watch_trades(symbol)
-            for t in trades:
-                tid = t.get("id")
-                if tid is not None:
-                    tid = str(tid)
-                    if tid in seen:
-                        continue
-                    if len(order) == order.maxlen:
-                        seen.discard(order[0])
-                    order.append(tid)
-                    seen.add(tid)
-                ts = t.get("timestamp") or ex.milliseconds()
-                price = t.get("price")
-                if price is None:
-                    continue
-                tick = Tick(symbol, int(ts), float(price), float(t.get("amount") or 0.0), tid, t.get("side"))
-                self._emit(TickEvent(self.exchange_id, tick))
-                for tf, agg in aggs.items():
-                    changed = agg.add_tick(tick)
-                    if changed:
-                        self._publish(symbol, tf, changed)
+            for t in await ex.watch_trades(symbol):
+                self._ingest_trade(ex, symbol, t)
+
+    async def _watch_trades_batched(self, ex) -> None:
+        """All symbols on one subscription; each trade names its symbol."""
+        while True:
+            for t in await ex.watch_trades_for_symbols(self.symbols):
+                sym = t.get("symbol")
+                if sym in self._aggs:
+                    self._ingest_trade(ex, sym, t)
+
+    async def _watch_books_batched(self, ex) -> None:
+        """All order books on one subscription; ccxt returns the book that changed, with its symbol."""
+        last: dict[str, int] = {}
+        announced: set[str] = set()
+        while True:
+            book = await ex.watch_order_book_for_symbols(self.symbols, 20)
+            symbol = book.get("symbol")
+            if symbol not in self._aggs:
+                continue
+            now = ex.milliseconds()
+            problem = self._validator.check(symbol, book)
+            if problem:
+                self._emit(BookSyncEvent(self.exchange_id, symbol, now, "unsynced", problem, int(book.get("nonce") or 0)))
+                announced.discard(symbol)
+                if self._validator.exhausted(symbol):
+                    raise RuntimeError(f"{symbol} order book from {self.exchange_id} is unreliable ({problem}); resubscribing")
+                continue
+            if symbol not in announced:
+                self._emit(BookSyncEvent(self.exchange_id, symbol, now, "synced", "ccxt order book", int(book.get("nonce") or 0)))
+                announced.add(symbol)
+            if now - last.get(symbol, 0) < self.book_interval_ms:
+                continue
+            last[symbol] = now
+            ev = summarize_book(self.exchange_id, symbol, now, book.get("bids") or [], book.get("asks") or [], seq=int(book.get("nonce") or 0))
+            if ev is not None:
+                self._emit(ev)
 
     async def _native_book(self, ex) -> None:
         """Binance/Binance.US: the sequenced local book. If it fails for any reason (endpoint change, snapshot
