@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3 — Pulse: taker-fee override on the settings tab
+
+- "Taker fee" on the Pulse settings tab: 0 keeps the exchange's published lowest-tier fee (Coinbase: 1.2% a side, which makes a 2.48% round trip and blocks every entry); an account on a cheaper tier can enter its own rate, and the cost gate and every paper fill use it.
+
 ## 0.5.2 — one subscription per channel on Coinbase; Pulse shares the Market feed on the same exchange
 
 - Exchanges that accept a multi-symbol subscription (Coinbase, Kraken) now get one subscribe message per channel instead of one per coin per channel. Two connections subscribing 20 coins each, one message at a time, is what produced Coinbase's "rate limit exceeded" and the keepalive timeouts that followed every reconnect.

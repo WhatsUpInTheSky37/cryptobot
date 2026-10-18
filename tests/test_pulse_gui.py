@@ -75,6 +75,12 @@ def test_pulse_page_renders_all_states(app):
     page.start()
     assert ctrl.cmds[-1][3:] == ("coinbase", ["BTC/USD", "ETH/USD"])
     assert store.get_setting("pulse.exchange") == "coinbase" and store.get_setting("pulse.symbols") == ["BTC/USD", "ETH/USD"]
+    # the taker-fee override: 0 keeps the exchange's published fee, a value is stored as a fraction per side
+    assert ctrl.cmds[-1][1]["costs"]["fee_rate_override"] is None
+    page.fee.setValue(0.4)
+    page.start()
+    assert ctrl.cmds[-1][1]["costs"]["fee_rate_override"] == pytest.approx(0.004)
+    assert PulsePage(ctrl, store).fee.value() == pytest.approx(0.4), "the override is remembered"
     snaps = [
         PulseSnapshot("ETH/USDT", 1, "excluded", 0, 0, 0, 0, 0, 0, 0, 0.0, 3000.0, 0.0, 0.1, "", False, "stale_trades", "last trade 120s ago", "range"),
         PulseSnapshot("BTC/USDT", 1, "prepared", 88.0, 20.0, 90, 90, 90, 90, 90, 0.5, 80_000.0, 0.01, 0.2, "prepared", True, "ok", "", "trend_up",

@@ -365,6 +365,15 @@ class PulsePage(QWidget):
         self.min_tpm.setValue(self.cfg.health.min_trades_per_min)
         self.min_tpm.setToolTip("Below this activity a market is excluded for a while. 0 disables the activity filter.")
         sf.addRow("Exclude below", self.min_tpm)
+        self.fee = QDoubleSpinBox()
+        self.fee.setRange(0.0, 5.0)
+        self.fee.setDecimals(3)
+        self.fee.setSingleStep(0.05)
+        self.fee.setSuffix(" % per side")
+        self.fee.setSpecialValueText("exchange's published fee")
+        self.fee.setValue((self.cfg.costs.fee_rate_override or 0.0) * 100.0)
+        self.fee.setToolTip("Taker fee Pulse charges itself per side. 0 uses the fee the exchange publishes for its lowest tier (Coinbase: 1.2%). If your account is on a cheaper tier, enter it here; the cost gate and every paper fill use it.")
+        sf.addRow("Taker fee", self.fee)
         side.addWidget(sg)
         st_card, stl = _card()
         self.s_memory = QLabel("—")
@@ -493,8 +502,9 @@ class PulsePage(QWidget):
     def _config(self) -> PulseConfig:
         risk = self.cfg.risk.model_copy(update={"risk_per_trade_pct": self.risk.value(), "daily_loss_pct": self.daily.value(), "max_positions": self.maxpos.value()})
         health = self.cfg.health.model_copy(update={"stale_trade_s": self.stale.value(), "min_trades_per_min": self.min_tpm.value()})
+        costs = self.cfg.costs.model_copy(update={"fee_rate_override": (self.fee.value() / 100.0) if self.fee.value() > 0 else None})
         self.cfg = self.cfg.model_copy(update={"budget": self.budget.value(), "risk_per_trade_pct": self.risk.value(), "daily_loss_pct": self.daily.value(),
-                                               "max_positions": self.maxpos.value(), "event_cooldown_s": self.cooldown.value(), "risk": risk, "health": health})
+                                               "max_positions": self.maxpos.value(), "event_cooldown_s": self.cooldown.value(), "risk": risk, "health": health, "costs": costs})
         self.cfg = PulseConfig.model_validate(self.cfg.model_dump())
         self.store.set_setting("pulse.config", self.cfg.model_dump())
         return self.cfg
