@@ -39,7 +39,9 @@ class Store:
             def _pragmas(dbapi_conn, _record):  # noqa: ANN001
                 cur = dbapi_conn.cursor()
                 cur.execute("PRAGMA journal_mode=WAL")
-                cur.execute("PRAGMA synchronous=NORMAL")
+                # The client-ID journal must survive power loss before an order
+                # can leave the process, not just an ordinary process restart.
+                cur.execute("PRAGMA synchronous=FULL")
                 cur.execute("PRAGMA busy_timeout=5000")
                 cur.close()
 

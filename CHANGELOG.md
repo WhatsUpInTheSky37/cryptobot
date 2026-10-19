@@ -5,6 +5,7 @@
 - Journal uncertain orders, recover terminal fills exactly once, and commit fill/position/checkpoint accounting atomically.
 - Preserve liquidation intent and residual protection after failed exits; use venue-specific native stop types and scoped one-quote books.
 - Separate trader and Pulse workers from the asynchronous feed; add an independent engine watchdog and desktop ownership lock.
+- Retire crashed-engine readers and stale IPC events before restarting; sync the order journal durably before submitting requests.
 - Account for commission assets, complete-position P&L and daily equity changes; validate risk inputs and add loss-at-stop limits.
 - Persist DCA schedules and bounded indicator checkpoints; repair causal labels, research sampling, entry-candle stops and funded method comparisons.
 - Add failure-injection and batch/checkpoint equivalence regressions, frozen dependencies, and pull-request CI.

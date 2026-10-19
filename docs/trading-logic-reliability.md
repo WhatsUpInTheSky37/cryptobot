@@ -10,11 +10,16 @@ receipt continue while synchronous exchange requests wait. Pulse has a separate
 worker so its similarity search and model fitting cannot block the trading feed.
 An independent GUI timer checks whether the engine process died. A local app
 lock prevents two desktop engines from opening the same trading book.
+Crash recovery retires the old event reader and IPC queues before a restart,
+discards old-engine events already queued in Qt, and can safely detach a reader
+stranded by a partial IPC frame.
 
 Each real order writes its approval and client identifier to `order_journal`
 before submission. Ambiguous requests are not resubmitted. Unknown, acknowledged,
-and unbooked terminal orders are recovered before entries can proceed. A terminal
-order's aggregate fill, position, equity, execution key, and saved ledger commit
+and unbooked terminal orders are recovered before entries can proceed.
+The SQLite WAL uses `synchronous=FULL` so the pre-submission journal commit is
+synced before an exchange request can leave the process.
+A terminal order's aggregate fill, position, equity, execution key, and saved ledger commit
 in one transaction. Replaying the same execution key is a no-op.
 
 STOP pauses entries while continuing position supervision. Emergency stop and

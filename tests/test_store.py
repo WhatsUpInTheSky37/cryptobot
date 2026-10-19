@@ -2,6 +2,17 @@ from cryptobot.core.models import Bar
 from cryptobot.db.store import Store
 
 
+def test_order_journal_commit_is_durable_before_submission(tmp_path):
+    store = Store(tmp_path / "journal.db")
+    with store.engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+        assert connection.exec_driver_sql("PRAGMA synchronous").scalar() == 2  # FULL
+    store.journal_order("client", "book", "BTC/USD", {"amount": 1})
+    store.engine.dispose()
+    reopened = Store(tmp_path / "journal.db")
+    assert reopened.pending_orders("book")[0]["client_id"] == "client"
+
+
 def test_store_creates_db_and_roundtrips(tmp_path):
     db = tmp_path / "sub" / "t.db"
     store = Store(db)
@@ -35,3 +46,4 @@ def test_upsert_many_bars_in_one_call(tmp_path):
     assert len(store.load_bars("binanceus", "BTC/USDT", 3600, limit=20_000)) == 9000
     assert store.upsert_bars("binanceus", bars[:1200]) == 1200  # idempotent across chunks
     assert len(store.load_bars("binanceus", "BTC/USDT", 3600, limit=20_000)) == 9000
+
