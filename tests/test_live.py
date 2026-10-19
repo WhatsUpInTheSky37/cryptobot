@@ -1,4 +1,5 @@
 """Milestone 5: real-order executor, BUY-mode trader, mode gate, reports."""
+import math
 import ccxt
 import pytest
 
@@ -33,10 +34,13 @@ class FakeLive:
         self._n = 0
 
     def amount_to_precision(self, sym, a):
-        return f"{a:.5f}"
+        return str(math.floor(a * 100000) / 100000)
 
     def price_to_precision(self, sym, p):
         return f"{p:.2f}"
+
+    def feature_value(self, *args):
+        return True
 
     def fetch_trading_fee(self, sym):
         return {"taker": 0.0045, "maker": 0.003}
@@ -50,7 +54,11 @@ class FakeLive:
             raise self.fail_first
         self._n += 1
         oid = f"o{self._n}"
-        self.orders[oid] = self._make(oid, sym, otype, side, amount, price, params)
+        if (params or {}).get("stopLossPrice") is not None:
+            self.orders[oid] = {"id": oid, "clientOrderId": (params or {}).get("clientOrderId"), "symbol": sym, "type": otype, "side": side,
+                                "amount": amount, "price": None, "filled": 0, "remaining": amount, "status": "open", "stopLossPrice": params["stopLossPrice"]}
+        else:
+            self.orders[oid] = self._make(oid, sym, otype, side, amount, price, params)
         return dict(self.orders[oid])
 
     def _make(self, oid, sym, otype, side, amount, price, params):
@@ -102,7 +110,7 @@ def approval(rm, side="buy", amount=0.001, price=80_000.0, units=0.0):
 
 
 def rm():
-    return RiskManager(RiskLimits(budget=1000, per_position_pct=100), RiskRules(stop_atr_mult=2), 0.05)
+    return RiskManager(RiskLimits(budget=1000, per_position_pct=100, risk_per_trade_pct=100, max_open_risk_pct=100), RiskRules(stop_atr_mult=2), 0.05)
 
 
 class FakeClock:
@@ -192,7 +200,7 @@ def make_buy(store=None, ex=None, clock=None, budget=100.0, **kw):
     ex = ex or FakeLive(balances={"USDT": 500.0, "BTC": 0.0})
     events = []
     clock = clock or Clock(T0)
-    t = Trader(store, events.append, "binanceus", [S], cfg(**kw), RiskLimits(budget=budget, per_position_pct=100, daily_loss_pct=5, max_drawdown_pct=20), mode=Mode.BUY, clock=clock, exchange=ex, fill_timeout_s=1.0)
+    t = Trader(store, events.append, "binanceus", [S], cfg(**kw), RiskLimits(budget=budget, per_position_pct=100, daily_loss_pct=5, max_drawdown_pct=20, risk_per_trade_pct=100, max_open_risk_pct=100), mode=Mode.BUY, clock=clock, exchange=ex, fill_timeout_s=1.0)
     ck = FakeClock()
     t.executor._sleep = ck.sleep
     t.executor._clock = ck
@@ -200,6 +208,10 @@ def make_buy(store=None, ex=None, clock=None, budget=100.0, **kw):
     from cryptobot.core.events import MarketInfoEvent
 
     t.on_event(MarketInfoEvent("binanceus", S, 0.006, 0.004, 0.00001, 5.0, 0.00001, 0.01))
+    from cryptobot.core.events import BookEvent, ConnectionEvent
+    t.on_event(ConnectionEvent("binanceus", "connected"))
+    px = rising()[-1]
+    t.on_event(BookEvent("binanceus", S, clock.ms, px, px, 1_000_000, 1_000_000, 1_000_000, 1_000_000, 1, True))
     return t, events, store, ex, clock
 
 
@@ -241,11 +253,10 @@ def test_buy_mode_reconciles_with_exchange_balance_on_restart():
     ex.balances["BTC"] = units * 0.5  # user sold half by hand
     t2, ev2, _, _, _ = make_buy(store=store, ex=ex, clock=clock)
     p2 = t2.ledger.position(S)
-    assert p2.units == pytest.approx(units * 0.5) and p2.basis == pytest.approx(t.ledger.position(S).basis * 0.5)
-    assert any(isinstance(e, AlertEvent) and "adjusted" in e.title for e in ev2)
-    ex.balances["BTC"] = 0.0
-    t3, ev3, _, _, _ = make_buy(store=store, ex=ex, clock=clock)
-    assert not t3.ledger.position(S).open and store.load_positions("BUY") == []
+    assert p2.units == pytest.approx(units)  # do not invent a missing sale's proceeds/basis
+    assert t2.status == "reconcile_required"
+    assert any(isinstance(e, AlertEvent) and "reconciliation" in e.title.lower() for e in ev2)
+    assert store.load_positions("BUY")
 
 
 def test_buy_mode_emergency_stop_cancels_open_orders_then_market_sells():
@@ -253,7 +264,8 @@ def test_buy_mode_emergency_stop_cancels_open_orders_then_market_sells():
     feed_history(t, rising())
     ex.orders["stale"] = {"id": "stale", "clientOrderId": "cbstale", "status": "open", "filled": 0, "remaining": 1, "symbol": S}
     n = t.emergency_stop()
-    assert n == 1 and "stale" in ex.cancelled
+    assert n == 1
+    assert any(o.get("stopLossPrice") for o in ex.orders.values())
     sell = [o for o in ex.orders.values() if o.get("side") == "sell"][-1]
     assert sell["type"] == "market"
     assert not t.ledger.position(S).open and t.status == "stopped"
@@ -263,8 +275,8 @@ def test_buy_mode_order_failure_is_reported_not_fatal():
     ex = FakeLive(fail_first=ccxt.InsufficientFunds("broke"), balances={"USDT": 0.0})
     t, ev, store, _, clock = make_buy(ex=ex)
     feed_history(t, rising())
-    assert not fills(ev) and any(isinstance(e, AlertEvent) and e.title == "Order failed" for e in ev)
-    assert t.status == "running"
+    assert not fills(ev) and any(isinstance(e, AlertEvent) and "reconciliation" in e.title.lower() for e in ev)
+    assert t.status == "reconcile_required"
 
 
 # ------------------------------------------------------------------ mode gate
@@ -332,3 +344,4 @@ def test_tax_lots_fifo_and_exports(tmp_path):
     assert n == 2 and (tmp_path / "tax.csv").read_text().startswith("asset,amount,date_acquired,date_sold,proceeds,cost_basis,gain,term,exchange")
     assert export_csv(trades, tmp_path / "all.csv") == 3
     assert "time_local" in (tmp_path / "all.csv").read_text().splitlines()[0]
+

@@ -63,7 +63,7 @@ def bid_price(k_bar, trades: np.ndarray | None, ts_ms: int, cfg: EWConfig, ref: 
 
 def _entry_index(k: np.ndarray, setup_ms: int, method: str) -> int | None:
     """Index of the bar at whose OPEN we would enter, or None if the method never triggers."""
-    idx = np.searchsorted(k["ts"], setup_ms, side="right")  # the first bar after the setup time
+    idx = np.searchsorted(k["ts"], setup_ms, side="left")  # features use bars strictly before setup_ms
     if idx >= len(k) - 1:
         return None
     if method == "A":
@@ -91,16 +91,22 @@ def _entry_index(k: np.ndarray, setup_ms: int, method: str) -> int | None:
     return None
 
 
-def simulate_trade(k: np.ndarray, trades: np.ndarray | None, symbol: str, setup_ms: int, entry_method: str, exit_method: str, cfg: EWConfig, *, target_pct: float | None = None, vol_pct: float | None = None, budget: float = 100.0, equity: float | None = None) -> TradeResult | None:
+def simulate_trade(k: np.ndarray, trades: np.ndarray | None, symbol: str, setup_ms: int, entry_method: str, exit_method: str, cfg: EWConfig, *, target_pct: float | None = None, vol_pct: float | None = None, budget: float = 100.0, equity: float | None = None, max_notional: float | None = None) -> TradeResult | None:
     ex: ExitConfig = cfg.exits
     i0 = _entry_index(k, setup_ms, entry_method)
     if i0 is None:
         return None
+    # Volatility belongs to the information set at entry, irrespective of a
+    # caller's full-history summary.
+    prior = k[max(0, i0 - 60):i0]
+    vol_pct = float(np.mean((prior["high"] - prior["low"]) / np.maximum(prior["close"], 1e-12) * 100)) if len(prior) else None
     bar = k[i0]
     equity = equity if equity is not None else budget
     stop_pct = ex.stop_pct if exit_method != "volatility" else max(ex.stop_pct, (vol_pct or ex.stop_pct) * 1.5)
     risk_usd = equity * cfg.risk.risk_per_trade_pct / 100.0
     notional = min(risk_usd / (stop_pct / 100.0), budget * 0.5)
+    if max_notional is not None:
+        notional = min(notional, max_notional)
     recent_vol = float(k["quote_volume"][max(0, i0 - 5):i0].mean()) if i0 > 0 else float(bar["quote_volume"])
     notional = min(notional, recent_vol * cfg.risk.max_position_share_of_minute_volume) if recent_vol > 0 else 0.0
     if notional < 5.0:
@@ -148,7 +154,7 @@ def simulate_trade(k: np.ndarray, trades: np.ndarray | None, symbol: str, setup_
         hi, lo, op = float(b["high"]), float(b["low"]), float(b["open"])
         tr.mfe_pct = max(tr.mfe_pct, (hi / ask - 1) * 100)
         tr.mae_pct = min(tr.mae_pct, (lo / ask - 1) * 100)
-        if j > i0 and lo <= stop:
+        if lo <= stop:
             # a stop is a market order after the level trades: filled at the worse of the stop and the open of the bar, bid side
             fill = bid_price(b, trades, int(b["ts"]), cfg, ref=min(stop, op))
             sell(j, remaining, fill, "stop")
@@ -209,3 +215,4 @@ def summarize(trades: list[TradeResult], budget: float) -> dict[str, Any]:
     return {"trades": len(trades), "net_pnl": float(pnls.sum()), "net_pct": float(pnls.sum() / budget * 100), "win_rate": float(np.mean(pnls > 0)),
             "profit_factor": (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0), "expectancy_pct": float(np.mean([t.pnl_pct for t in trades])),
             "max_drawdown_pct": dd, "fees": float(sum(t.fees for t in trades)), "avg_mfe_pct": float(np.mean([t.mfe_pct for t in trades])), "avg_mae_pct": float(np.mean([t.mae_pct for t in trades]))}
+

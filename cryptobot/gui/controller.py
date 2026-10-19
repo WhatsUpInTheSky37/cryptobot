@@ -5,7 +5,7 @@ import logging
 import multiprocessing as mp
 import queue
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Signal, QTimer
 
 from cryptobot.config import AppPaths
 from cryptobot.core.events import (
@@ -84,6 +84,15 @@ class EngineController(QObject):
         self._bridge: _Bridge | None = None
         self.exchange: str = ""
         self.symbols: list[str] = []
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(1000)
+        self._watchdog.timeout.connect(self._check_process)
+        self._watchdog.start()
+
+    def _check_process(self):
+        if self._proc is not None and not self._proc.is_alive() and self._proc.exitcode is not None:
+            self.engine_state.emit("crashed")
+            self._proc = None
 
     @property
     def running(self) -> bool:
@@ -213,3 +222,4 @@ class EngineController(QObject):
             self.pulse_event.emit(ev)
         elif isinstance(ev, EWStatusEvent):
             self.ew_status.emit(ev)
+

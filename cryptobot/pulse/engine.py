@@ -38,7 +38,7 @@ from cryptobot.db.store import Store
 from cryptobot.engine.risk import MarketInfo, Rejection
 from cryptobot.pulse import ml as mlmod
 from cryptobot.pulse.config import PulseConfig, break_even_win_rate, expected_value_pct
-from cryptobot.pulse.costs import assess, expected_move_pct, plan_exits, round_trip_costs
+from cryptobot.pulse.costs import assess, expected_move_pct, plan_exits, round_trip_costs, slippage_per_side_pct
 from cryptobot.pulse.features import Observation, Scores, SymbolFeatures
 from cryptobot.pulse.health import HealthStatus, SymbolHealth
 from cryptobot.pulse.memory import KEYS, Estimate, MarketMemory, row_from_event
@@ -104,6 +104,8 @@ class PulseEngine:
         self.exchange_id = exchange_id
         self.symbols = list(symbols)
         self.cfg = config
+        if not self.cfg.wallet_quote and self.symbols:
+            self.cfg.wallet_quote = self.symbols[0].partition("/")[2]
         if slippage_pct is not None:
             # the Market page's slippage setting can raise the assumption, never zero it: a fill always costs something
             self.cfg.costs.base_slippage_pct = max(float(slippage_pct), self.cfg.costs.base_slippage_pct)
@@ -118,13 +120,13 @@ class PulseEngine:
             h.min_obs = config.min_obs
             h.obs_interval_s = config.obs_interval_s
             self.sym[s] = _SymState(SymbolFeatures(s, config.window_s, config.obs_interval_s, config.history_obs, config.min_obs), h)
-        self.memory = MarketMemory(store, config.k_similar, config.min_similar, config.prior_p, config.overlap_ms, int(config.min_evidence_span_h * 3_600_000))
+        self.memory = MarketMemory(store, config.k_similar, config.min_similar, config.prior_p, max(config.overlap_ms, config.max_hold_s * 1000), int(config.min_evidence_span_h * 3_600_000))
         self.tracker = OutcomeTracker(store, self._on_resolved)
         self.modes: dict[str, PaperTrader] = {
             m.key: PaperTrader(m, config, store, exchange_id, clock_ms=self._now_ms, timezone=timezone, fallback_fee=fallback_fee) for m in config.modes
         }
         self.model: mlmod.PulseModel | None = None
-        raw = store.get_setting("pulse.ml.model")
+        raw = store.get_setting("pulse.ml.model.v2")
         if raw:
             self.model = mlmod.PulseModel.from_json(raw)
         self.ml_note = store.get_setting("pulse.ml.note", "") or ""
@@ -144,7 +146,13 @@ class PulseEngine:
         now = self._now_ms()
         restored, abandoned = self.tracker.restore(now)
         for key, m in self.modes.items():
-            m.restore(self.store.get_setting(f"pulse.mode.{key}.state"))
+            m.restore(self.store.get_setting(f"pulse.mode.{self.exchange_id}.{key}.state"))
+            for s in m.positions:
+                if s not in self.sym:
+                    h = SymbolHealth(self.cfg.health)
+                    h.min_obs, h.obs_interval_s = self.cfg.min_obs, self.cfg.obs_interval_s
+                    self.sym[s] = _SymState(SymbolFeatures(s, self.cfg.window_s, self.cfg.obs_interval_s, self.cfg.history_obs, self.cfg.min_obs), h)
+                    self.symbols.append(s)
         self.message = "Validating market data: scores need a few minutes of healthy history per coin."
         if restored or abandoned:
             self.message += f" Resumed {restored} pending setup(s); {abandoned} abandoned (not watched)."
@@ -164,6 +172,8 @@ class PulseEngine:
     # --------------------------------------------------------------- events
 
     def on_event(self, ev: Any) -> None:
+        if getattr(ev, "exchange", self.exchange_id) != self.exchange_id:
+            return
         if isinstance(ev, ConnectionEvent):
             self.connected = ev.status == "connected"
             for st in self.sym.values():
@@ -184,7 +194,7 @@ class PulseEngine:
         if not self.running:
             return
         if isinstance(ev, MarketInfoEvent) and ev.symbol in self.sym:
-            self._infos[ev.symbol] = MarketInfo(ev.symbol, ev.taker_fee or self.fallback_fee, ev.maker_fee, ev.min_amount, ev.min_cost, ev.amount_step, ev.price_step)
+            self._infos[ev.symbol] = MarketInfo(ev.symbol, ev.taker_fee if ev.taker_fee is not None else self.fallback_fee, ev.maker_fee, ev.min_amount, ev.min_cost, ev.amount_step, ev.price_step)
         elif isinstance(ev, TickEvent) and ev.tick.symbol in self.sym:
             st = self.sym[ev.tick.symbol]
             st.feats.add_tick(ev.tick)
@@ -343,12 +353,18 @@ class PulseEngine:
     def _reference_plan(self, symbol: str, obs: Observation, est: Estimate) -> tuple[float, float, float, Any]:
         """(target, stop, expected move, costs) for a reference-size trade, used for the record and the display."""
         c = self.cfg.costs
-        move = expected_move_pct(obs.vol_pct, c.hold_minutes_for_move, est.expected_mfe_pct if est.sufficient else None)
+        move = expected_move_pct(obs.vol_pct, c.hold_minutes_for_move)
         target, stop = plan_exits(obs.vol_pct, move, stop_vol_mult=self.cfg.stop_vol_mult, min_stop_pct=self.cfg.min_stop_pct, max_stop_pct=self.cfg.max_stop_pct,
                                   target_capture=c.target_capture, max_target_pct=c.max_target_pct, adaptive=self.cfg.adaptive, fixed_target=self.cfg.target_pct, fixed_stop=self.cfg.stop_pct)
+        stop = max(stop, self.cfg.stop_spread_mult * obs.spread_pct)
         notional = min(self.cfg.budget * self.cfg.risk.risk_per_trade_pct / 100.0 / (stop / 100.0) if stop > 0 else 0.0, self.cfg.budget * self.cfg.risk.per_position_pct / 100.0)
         costs = round_trip_costs(self._fee_rate(symbol), obs.spread_pct, notional, obs.bid_depth, obs.ask_depth, band_pct=c.impact_band_pct, base_slip_pct=c.base_slippage_pct)
         return target, stop, move, costs
+
+    def _estimate(self, direction, vec, regime, symbol, obs, min_n=None):
+        target, stop, _, _ = self._reference_plan(symbol, obs, None)
+        return self.memory.estimate(direction, vec, regime, min_n=min_n, target_pct=target, stop_pct=stop,
+                                    horizon_ms=self.cfg.max_hold_s * 1000, policy_version="bidask-v2", exchange=self.exchange_id)
 
     def _p_for_ev(self, est: Estimate) -> float | None:
         """The probability the expected value is computed from: the lower confidence bound when conservative."""
@@ -357,7 +373,7 @@ class PulseEngine:
         return est.ci_low if self.cfg.conservative_p and est.ci_low is not None else est.p_target
 
     def _display_assessment(self, symbol: str, obs: Observation, sc: Scores, direction: str, regime: str) -> dict[str, Any]:
-        est = self.memory.estimate(direction, self._vec(sc, obs), regime)
+        est = self._estimate(direction, self._vec(sc, obs), regime, symbol, obs)
         target, stop, move, costs = self._reference_plan(symbol, obs, est)
         a = assess(target, stop, costs, self._p_for_ev(est), min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
         return {"prs": sc.prs, "target_pct": target, "stop_pct": stop, "expected_move_pct": move, "cost_pct": costs.total_pct, "fee_pct": costs.fee_pct, "spread_pct": costs.spread_pct,
@@ -366,11 +382,16 @@ class PulseEngine:
 
     def _signal(self, symbol: str, st: _SymState, obs: Observation, sc: Scores, direction: str, now_ms: int, confirmed: bool, absorb: float) -> int:
         vec = self._vec(sc, obs)
-        est = self.memory.estimate(direction, vec, st.regime.name)
+        est = self._estimate(direction, vec, st.regime.name, symbol, obs)
         target, stop, move, costs = self._reference_plan(symbol, obs, est)
         a = assess(target, stop, costs, self._p_for_ev(est), min_ev_pct=self.cfg.ev_margin_pct, min_rr=1.0, min_target_cost_mult=self.cfg.min_target_cost_mult)
         status = "signal" if direction == "long" else "research"
         features = {"raw_long": obs.raw_long, "raw_short": obs.raw_short, "scores": sc.as_dict(), "vol60_quote": obs.vol60_quote, "bid": obs.bid, "ask": obs.ask}
+        entry_depth = obs.ask_depth if direction == "long" else obs.bid_depth
+        entry_slip = slippage_per_side_pct(costs.notional, entry_depth, self.cfg.costs.impact_band_pct, self.cfg.costs.base_slippage_pct)
+        label_entry = obs.ask * (1 + entry_slip / 100) if direction == "long" else obs.bid * (1 - entry_slip / 100)
+        exit_depth = obs.bid_depth if direction == "long" else obs.ask_depth
+        label_cost = costs.fee_pct + slippage_per_side_pct(costs.notional, exit_depth, self.cfg.costs.impact_band_pct, self.cfg.costs.base_slippage_pct)
         eid = self.store.insert_pulse_event(
             ts_ms=now_ms, exchange=self.exchange_id, symbol=symbol, direction=direction, prs=sc.prs, f=sc.f, a=sc.a, w=sc.w, r=sc.r, c=sc.c, acc=sc.acc, vpr=sc.vpr, sx=sc.sx, vx=sc.vx,
             imbalance=obs.imb60, vol_pct=obs.vol_pct, spread_pct=obs.spread_pct, mid=obs.mid, bid=obs.bid, ask=obs.ask, bid_depth=obs.bid_depth, ask_depth=obs.ask_depth,
@@ -378,9 +399,9 @@ class PulseEngine:
             rr_after_costs=a.rr_after_costs or 0.0, similar_n=est.n, similar_eff=est.n_effective, similar_p=est.p_target or 0.0, p_stop=est.p_stop or 0.0, ci_low=est.ci_low or 0.0,
             ci_high=est.ci_high or 0.0, ev_pct=a.ev_pct if a.ev_pct is not None else 0.0, evidence="sufficient" if est.sufficient else "insufficient", regime=st.regime.name,
             health=st.status.status, confirmed=confirmed, status=status, reason=a.reason if direction == "long" else "bearish setup recorded for research (spot cannot short)",
-            features_json=json.dumps(features, default=float),
+            features_json=json.dumps(features, default=float), horizon_ms=self.cfg.max_hold_s * 1000, policy_version="bidask-v2", label_entry=label_entry,
         )
-        self.tracker.add(Pending(eid, symbol, direction, now_ms, obs.mid, target, stop, costs.total_pct, self.cfg.max_hold_s * 1000))
+        self.tracker.add(Pending(eid, symbol, direction, now_ms, label_entry, target, stop, label_cost, self.cfg.max_hold_s * 1000))
         self.events_recorded += 1
         self.store.set_setting("pulse.events_recorded", self.events_recorded)
         decisions: dict[str, tuple[bool, str]] = {}
@@ -398,13 +419,15 @@ class PulseEngine:
 
         def est_fn(min_n: int) -> Estimate:
             if min_n not in cache:
-                cache[min_n] = self.memory.estimate(setup.direction, setup.vec, setup.regime, min_n=min_n)
+                cache[min_n] = self._estimate(setup.direction, setup.vec, setup.regime, setup.symbol, setup.obs, min_n=min_n)
             return cache[min_n]
 
         ml_p = None
         if self.model is not None and self.model.usable:
             like = dict(setup.vec)
             like["regime"] = setup.regime
+            target, stop, _, _ = self._reference_plan(setup.symbol, setup.obs, None)
+            like.update(target_pct=target, stop_pct=stop, horizon_ms=self.cfg.max_hold_s * 1000, direction=setup.direction)
             ml_p = self.model.p(like)
         out: dict[str, tuple[bool, str]] = {}
         for key, m in self.modes.items():
@@ -425,7 +448,16 @@ class PulseEngine:
 
     def _on_price(self, symbol: str, price: float, now_ms: int) -> None:
         st = self.sym[symbol]
-        self.tracker.on_price(symbol, price, now_ms)
+        # Labels and paper exits use executable quotes, never an optimistic mid.
+        long_price = st.last_bid or price
+        short_price = st.last_ask or price
+        for direction, executable in (("long", long_price), ("short", short_price)):
+            pending = self.tracker.pending
+            subset = [p for p in pending if p.direction == direction]
+            other = [p for p in pending if p.direction != direction]
+            self.tracker.pending = subset
+            self.tracker.on_price(symbol, executable, now_ms)
+            self.tracker.pending.extend(other)
         info = self._info(symbol)
         for m in self.modes.values():
             closed = m.on_price(symbol, price, st.last_bid or price, st.last_ask or price, st.last_bid_depth, info, now_ms)
@@ -453,7 +485,8 @@ class PulseEngine:
     def train_now(self, now_ms: int | None = None) -> str:
         now_ms = now_ms or self._now_ms()
         self._last_train_ms = now_ms
-        events = self.store.load_pulse_events(limit=100_000, resolved_only=True, ascending=True)
+        events = [e for e in self.store.load_pulse_events(limit=100_000, resolved_only=True, ascending=True)
+                  if e.get("policy_version") == "bidask-v2" and e.get("exchange") == self.exchange_id and e.get("horizon_ms") == self.cfg.max_hold_s * 1000]
         try:
             model = mlmod.train(events)
         except Exception as e:  # noqa: BLE001
@@ -464,10 +497,10 @@ class PulseEngine:
         self.ml_note = rep.reason + (" — model retained for Mode C" if rep.improved else " — model NOT retained (no out-of-sample improvement)" if rep.ok else "")
         if rep.ok and rep.improved:
             self.model = model
-            self.store.set_setting("pulse.ml.model", model.to_json())
+            self.store.set_setting("pulse.ml.model.v2", model.to_json())
         else:
             self.model = None
-            self.store.set_setting("pulse.ml.model", "")
+            self.store.set_setting("pulse.ml.model.v2", "")
         self.store.set_setting("pulse.ml.note", self.ml_note)
         self.store.set_setting("pulse.ml.report", rep.as_dict())
         self.store.audit("pulse", "ml trained", level="INFO", report=rep.as_dict())
@@ -537,3 +570,4 @@ class PulseEngine:
             return
         self._last_status_ms = now
         self.emit(self.status())
+

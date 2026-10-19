@@ -3,7 +3,13 @@
 Budget-capped automated crypto trading desktop app with TEST and BUY modes.
 See [PLAN.md](PLAN.md) for the architecture, strategy analysis, wireframes and milestones.
 
-**Status: 0.4.0 — Milestone 6 done; Crypto Pulse rebuilt; Early Warning added (see CHANGELOG.md).** BUY mode is locked until 14 days of TEST mode have passed. The bot trades in TEST mode only: live prices, simulated orders, no real money. BUY mode is locked until Milestone 5.
+**Status: 0.6.0 — trading-logic and reliability fixes.** See
+[the implementation and validation notes](docs/trading-logic-reliability.md) for
+order recovery, native protection, accounting, strategy and research changes.
+BUY mode remains subject to the TEST-age, API-key and budget gates. Operational
+exchange validation and forward strategy evidence are required before relying on
+live operation.
+
 
 ## What works now
 - Dark-themed desktop app with navigation, always-visible mode badge (STOPPED / TEST / BUY), clock and connection status.
@@ -11,7 +17,7 @@ See [PLAN.md](PLAN.md) for the architecture, strategy analysis, wireframes and m
 - Trading engine runs in its own process, reconnects automatically after a network drop, and backfills the candles it missed.
 - Local SQLite database (settings, 1m/5m candles, audit log; trade/position tables ready for later milestones).
 - Settings page shows the live engine log.
-- BUY mode: real orders via marketable limit orders capped at 0.25% slippage, partial fills handled, retries never duplicate an order (client order ids), actual fees and fill prices recorded, restart reconciles positions against the exchange. Locked until 14 days of TEST, an API key that can trade, and typing BUY in a dialog that shows the TEST results. Budget capped at $250 for the first 30 days of BUY. BUY → TEST is one click (keep or close real positions). Every switch is logged.
+- BUY mode: real orders via marketable limit orders capped at 0.25% slippage, partial fills and uncertain submissions journaled, ambiguous submissions paused for reconciliation, fees and execution details recorded, and restart recovers journaled orders before checking cash and inventory. Locked until 14 days of TEST, an API key that can trade, and typing BUY in a dialog that shows the TEST results. Budget capped at $250 for the first 30 days of BUY. BUY → TEST is one click (keep or close real positions). Every switch is logged.
 - History & Reports: all trades with expected vs actual price and slippage, TEST / BUY / Both filter, TEST-vs-BUY comparison over the same period, daily / weekly / monthly summaries, CSV export, and a FIFO tax-lot export for BUY trades.
 - First-run setup wizard: exchange → API key (tested; keys that can withdraw are refused; stored in the OS keychain) → budget and limits → coins → strategy → start in TEST mode. Re-runnable from Settings.
 - Coins screen: every pair on the exchange with price, 24h volume, change, spread and range; "Suggested only" hides thin markets; the bot trades the selected list.
@@ -23,7 +29,7 @@ See [PLAN.md](PLAN.md) for the architecture, strategy analysis, wireframes and m
 - Reports: daily / weekly / monthly summaries with a P&L chart.
 - Dashboard: START / STOP / EMERGENCY STOP, the TEST | BUY toggle (BUY locked), budget gauge (allocated / in use / available / today's P&L / equity / drawdown), open positions with stops, equity curve, trade and signal feed. Halts itself at the daily-loss or drawdown limit and shows an alert with Resume.
 - Risk & Budget screen: budget (change dialog: type twice, +50% max step), per-position limit, daily loss limit, drawdown limit, stop-loss / trailing / take-profit, TEST slippage.
-- Trading engine: the same signal function as the backtester runs on closed bars of the strategy timeframe; every order needs a risk-manager approval (hard budget cap incl. fees and slippage, per-position cap, exchange minimums, mandatory stop) and is consumed once by the executor. TEST mode uses a simulated executor; the real one cannot even be constructed yet. State is saved so a restart reloads open positions.
+- Trading engine: the same signal function as the backtester runs on closed bars of the strategy timeframe; every order needs a risk-manager approval (hard budget cap incl. fees and slippage, per-position cap, exchange minimums, mandatory stop) and is consumed once by the executor. TEST mode uses a simulated executor; BUY uses a separate authenticated executor with durable order recovery and native protection. State is saved so a restart reloads open positions.
 - Strategy screen: seven strategies (EMA, MACD, RSI, Bollinger, Donchian, grid, DCA) plus the ADX regime gate and volatility targeting; sliders with plain-English tooltips; one-click backtest that downloads history, applies fees and slippage, compares with buy-and-hold and weekly DCA, runs walk-forward validation, and explains the result in plain English. The configuration you run is saved as what TEST / BUY mode will trade.
 
 ## Installing
@@ -34,9 +40,9 @@ See [PLAN.md](PLAN.md) for the architecture, strategy analysis, wireframes and m
 ## Running during development
 
 ```bash
-uv venv --python 3.12 .venv && uv pip install -p .venv/bin/python -e ".[dev]"
-.venv/bin/python -m cryptobot
-.venv/bin/python -m pytest
+uv sync --frozen --extra dev --python 3.12
+uv run --frozen --extra dev python -m cryptobot
+QT_QPA_PLATFORM=offscreen uv run --frozen --extra dev pytest -q
 ```
 
 Data and logs live in the OS app-data folder (`~/Library/Application Support/CryptoBot` and `~/Library/Logs/CryptoBot` on macOS).
@@ -60,3 +66,4 @@ cryptobot/
   gui/              theme, controller (process bridge), main window, pages, widgets
 tests/              pytest + hypothesis
 ```
+

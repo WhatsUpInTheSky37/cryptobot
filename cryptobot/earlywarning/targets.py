@@ -26,7 +26,7 @@ def outcome_after(k: np.ndarray, t0_ms: int, horizon_min: int, up_pct: float, do
         return None
     entry = float(after["open"][0]) * (1 + entry_slip_pct / 100.0)
     seg = after[: horizon_min]
-    if entry <= 0 or len(seg) == 0:
+    if entry <= 0 or len(seg) != horizon_min or not 0 <= int(seg["ts"][0]) - t0_ms < 60_000 or np.any(np.diff(seg["ts"]) != 60_000):
         return None
     highs = seg["high"] / entry - 1.0
     lows = seg["low"] / entry - 1.0
@@ -34,14 +34,17 @@ def outcome_after(k: np.ndarray, t0_ms: int, horizon_min: int, up_pct: float, do
     dn_i = np.where(lows <= -down_pct / 100.0)[0]
     hit = bool(up_i.size) and (not dn_i.size or up_i[0] < dn_i[0])
     stopped = bool(dn_i.size) and (not up_i.size or dn_i[0] <= up_i[0])
-    return {"entry": entry, "mfe_pct": float(highs.max() * 100.0), "mae_pct": float(lows.min() * 100.0), "hit": hit, "stopped": stopped, "close_pct": float((seg["close"][-1] / entry - 1.0) * 100.0), "bars": int(len(seg))}
+    stop_index = int(dn_i[0]) if dn_i.size else len(seg)
+    before_stop = highs[:stop_index]  # same-bar stop wins an ambiguous OHLC tie
+    return {"entry": entry, "mfe_pct": float(before_stop.max() * 100.0) if len(before_stop) else 0.0, "mae_pct": float(lows.min() * 100.0), "hit": hit, "stopped": stopped, "close_pct": float((seg["close"][-1] / entry - 1.0) * 100.0), "bars": int(len(seg)),
+            "high_path": highs.tolist(), "low_path": lows.tolist()}
 
 
 def collect_setups(store: EWStore, symbol: str, k: np.ndarray, cfg: EWConfig, lookback_min: int = 60) -> list[dict[str, Any]]:
     """Every 60-minute window the scanner would have seen (grid, event, control) whose EAS reached the setup level, with outcomes."""
     out = []
     slip = cfg.costs.spread_estimate_pct / 2 + cfg.costs.base_slippage_pct
-    rows = [w for w in store.windows(symbol) if (w["kind"] in ("grid",) or (w["kind"] in ("event", "control") and w["lookback_min"] == lookback_min))]
+    rows = [w for w in store.windows(symbol) if w["kind"] == "grid"]
     for w in rows:
         if w["eas"] is None or w["eas"] < cfg.targets.setup_eas:
             continue
@@ -50,7 +53,7 @@ def collect_setups(store: EWStore, symbol: str, k: np.ndarray, cfg: EWConfig, lo
             continue
         rec = {"symbol": symbol, "t0_ms": w["t0_ms"], "eas": w["eas"], "kind": w["kind"], "vec": [float(comps[c]) for c in COMPONENTS], "outcomes": {}}
         for h in cfg.horizons_min:
-            o = outcome_after(k, w["t0_ms"], h, cfg.targets.up_pct, cfg.targets.down_pct, slip)
+            o = outcome_after(k, w["t0_ms"], h, cfg.targets.up_pct, cfg.exits.stop_pct, slip)
             if o is not None:
                 rec["outcomes"][h] = o
         if rec["outcomes"]:
@@ -84,7 +87,7 @@ def _dedupe(setups: list[dict[str, Any]], overlap_min: int) -> list[dict[str, An
 def walk_forward_targets(setups: list[dict[str, Any]], cfg: EWConfig, *, n_folds: int = 4) -> dict[str, Any]:
     """Chronological expanding-window validation of Model A (probability) and Model B (MFE quantile target)."""
     setups = _dedupe(setups, max(cfg.horizons_min))
-    report: dict[str, Any] = {"n_setups": len(setups), "horizons": {}}
+    report: dict[str, Any] = {"n_setups": len(setups), "horizons": {}, "policy_version": "causal-v2"}
     rt_cost = 2 * cfg.costs.fee_rate * 100 + cfg.costs.spread_estimate_pct + 2 * cfg.costs.base_slippage_pct
     if len(setups) < 20:
         for h in cfg.horizons_min:
@@ -93,7 +96,7 @@ def walk_forward_targets(setups: list[dict[str, Any]], cfg: EWConfig, *, n_folds
     n = len(setups)
     edges = np.linspace(max(10, n // 3), n, n_folds + 1).astype(int)
     for h in cfg.horizons_min:
-        preds, actual, mfes, targets_pred = [], [], [], []
+        preds, actual, mfes, targets_pred, policy_nets = [], [], [], [], []
         base_rates = []
         for i in range(n_folds):
             tr_end, te_end = int(edges[i]), int(edges[i + 1])
@@ -117,6 +120,13 @@ def walk_forward_targets(setups: list[dict[str, Any]], cfg: EWConfig, *, n_folds
                 actual.append(1.0 if s["outcomes"][h]["hit"] else 0.0)
                 mfes.append(s["outcomes"][h]["mfe_pct"])
                 targets_pred.append(q_target)
+                o = s["outcomes"][h]
+                highs, lows = np.array(o.get("high_path", [])), np.array(o.get("low_path", []))
+                if len(highs) == h:
+                    up = np.flatnonzero(highs >= q_target / 100)
+                    dn = np.flatnonzero(lows <= -cfg.exits.stop_pct / 100)
+                    gross = q_target if len(up) and (not len(dn) or up[0] < dn[0]) else -cfg.exits.stop_pct if len(dn) else o["close_pct"]
+                    policy_nets.append(gross - rt_cost)
         n_oos = len(actual)
         if n_oos == 0:
             report["horizons"][str(h)] = {"label": NOT_RELIABLE, "reliable": False, "n_oos": 0, "reason": "no out-of-sample setups"}
@@ -130,7 +140,8 @@ def walk_forward_targets(setups: list[dict[str, Any]], cfg: EWConfig, *, n_folds
         prob_ok = n_oos >= cfg.targets.min_setups and brier_model < brier_base * 0.98  # must beat the base rate, not tie it
         target_ok = n_oos >= cfg.targets.min_setups and coverage >= cfg.targets.min_coverage
         net = target_gross - rt_cost
-        tradeable = target_ok and net > 0
+        policy_ev = float(np.mean(policy_nets)) if policy_nets else None
+        tradeable = target_ok and net > 0 and policy_ev is not None and policy_ev > 0
         if not target_ok:
             label = NOT_RELIABLE
         elif tradeable:
@@ -142,6 +153,7 @@ def walk_forward_targets(setups: list[dict[str, Any]], cfg: EWConfig, *, n_folds
             "probability_validated": bool(prob_ok), "target_gross_pct": target_gross, "target_net_pct": net, "coverage": coverage,
             "mfe_quantiles": {"p10": float(np.quantile(all_mfe, 0.1)), "p25": float(np.quantile(all_mfe, 0.25)), "p50": float(np.quantile(all_mfe, 0.5)), "p75": float(np.quantile(all_mfe, 0.75))},
             "reliable": bool(target_ok), "tradeable": bool(tradeable), "label": label,
+            "first_passage_net_pct": policy_ev, "stop_pct": cfg.exits.stop_pct, "horizon_min": h,
             "reason": "" if target_ok else f"{n_oos} OOS setups (need {cfg.targets.min_setups}), coverage {coverage:.0%} (need {cfg.targets.min_coverage:.0%})",
         }
     return report
@@ -184,6 +196,8 @@ class TargetEstimator:
 
     def target(self, horizon_min: int) -> tuple[float | None, str]:
         """(net target % if validated AND positive after costs, label). None means: do not trade on it."""
+        if self.report.get("policy_version") != "causal-v2":
+            return None, NOT_RELIABLE + (": rebuild research with causal-v2" if self.report.get("horizons") else "")
         h = self.report.get("horizons", {}).get(str(horizon_min))
         if not h or not h.get("reliable"):
             return None, NOT_RELIABLE
@@ -192,11 +206,16 @@ class TargetEstimator:
         return float(h["target_net_pct"]), h["label"]
 
     def gross_target(self, horizon_min: int) -> float | None:
+        if self.report.get("policy_version") != "causal-v2":
+            return None
         h = self.report.get("horizons", {}).get(str(horizon_min))
         return float(h["target_gross_pct"]) if h and h.get("reliable") else None
 
     def probability(self, horizon_min: int, vec: list[float]) -> float | None:
+        if self.report.get("policy_version") != "causal-v2":
+            return None
         h = self.report.get("horizons", {}).get(str(horizon_min))
         if not h or not h.get("probability_validated"):
             return None
         return _knn_p(self.setups, vec, horizon_min)
+

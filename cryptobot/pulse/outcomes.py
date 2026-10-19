@@ -34,6 +34,7 @@ class Pending:
     first_hit_ms: int | None = None
     rets: dict[str, float] = field(default_factory=dict)
     last_move: float = 0.0
+    last_observed_ms: int = 0
 
     def move(self, price: float) -> float:
         sign = 1.0 if self.direction == "long" else -1.0
@@ -60,7 +61,8 @@ class OutcomeTracker:
         self.pending: list[Pending] = []
 
     def add(self, p: Pending) -> None:
-        p.horizon_ms = max(p.horizon_ms, self.horizon_ms)
+        p.horizon_ms = p.horizon_ms or self.horizon_ms
+        p.last_observed_ms = p.start_ms
         self.pending.append(p)
 
     def restore(self, now_ms: int) -> tuple[int, int]:
@@ -68,12 +70,17 @@ class OutcomeTracker:
         marked abandoned (we were not watching). Returns (restored, abandoned)."""
         restored = abandoned = 0
         for e in self.store.load_pulse_events(limit=10_000, pending_only=True, ascending=True):
-            if now_ms - e["ts_ms"] >= self.horizon_ms:
+            horizon = int(e.get("horizon_ms") or self.horizon_ms)
+            if now_ms - e["ts_ms"] >= horizon and not e.get("first_hit"):
                 self.store.update_pulse_event(e["id"], outcome="abandoned", resolved_ts_ms=now_ms)
                 abandoned += 1
                 continue
-            p = Pending(e["id"], e["symbol"], e["direction"], int(e["ts_ms"]), float(e["mid"]), float(e["target_pct"]), float(e["stop_pct"]), float(e.get("cost_pct") or 0.0), self.horizon_ms,
+            p = Pending(e["id"], e["symbol"], e["direction"], int(e["ts_ms"]), float(e.get("label_entry") or e["mid"]), float(e["target_pct"]), float(e["stop_pct"]), float(e.get("cost_pct") or 0.0), horizon,
                         float(e.get("mfe_pct") or 0.0), float(e.get("mae_pct") or 0.0))
+            p.first_hit, p.first_hit_ms = e.get("first_hit"), e.get("first_hit_ms")
+            p.t_mfe, p.t_mae = int(e.get("time_to_mfe_ms") or 0), int(e.get("time_to_mae_ms") or 0)
+            p.last_move = float(e.get("last_move") or 0)
+            p.last_observed_ms = int(e.get("last_observed_ms") or p.start_ms)
             for name in OUTCOME_HORIZONS_MS:
                 v = e.get(f"ret_{name}")
                 if v is not None:
@@ -87,7 +94,17 @@ class OutcomeTracker:
         for p in self.pending:
             if p.symbol != symbol or now_ms < p.start_ms or price <= 0:
                 continue
+            if now_ms < p.last_observed_ms:
+                continue
+            if now_ms - p.last_observed_ms > 30_000 and p.first_hit is None:
+                self.store.update_pulse_event(p.event_id, outcome="abandoned", resolved_ts_ms=now_ms)
+                done.append(p)
+                continue
+            p.last_observed_ms = now_ms
             elapsed = now_ms - p.start_ms
+            if elapsed > p.horizon_ms:
+                done.append(p)
+                continue  # expiry uses the last in-horizon observation, never a later barrier crossing
             mv = p.move(price)
             p.last_move = mv
             if mv > p.mfe:
@@ -106,12 +123,14 @@ class OutcomeTracker:
                 done.append(p)
         for p in done:
             self.pending.remove(p)
-            self._finalize(p, now_ms)
+            current = self.store.pulse_event(p.event_id)
+            if not current or current.get("outcome") != "abandoned":
+                self._finalize(p, now_ms)
         return done
 
     def _finalize(self, p: Pending, now_ms: int) -> None:
         fields = dict(outcome=p.outcome(), mfe_pct=p.mfe, mae_pct=p.mae, resolved_ts_ms=now_ms, first_hit=p.first_hit, first_hit_ms=p.first_hit_ms,
-                      time_to_mfe_ms=p.t_mfe, time_to_mae_ms=p.t_mae, net_pct=p.net_pct())
+                      time_to_mfe_ms=p.t_mfe, time_to_mae_ms=p.t_mae, net_pct=p.net_pct(), last_move=p.last_move, last_observed_ms=p.last_observed_ms)
         for name in OUTCOME_HORIZONS_MS:
             fields[f"ret_{name}"] = p.rets.get(name)
         self.store.update_pulse_event(p.event_id, **fields)
@@ -121,8 +140,9 @@ class OutcomeTracker:
     def flush(self, now_ms: int) -> None:
         """Persist partial progress (called periodically so a crash keeps what we saw)."""
         for p in self.pending:
-            fields = dict(mfe_pct=p.mfe, mae_pct=p.mae, first_hit=p.first_hit, first_hit_ms=p.first_hit_ms, time_to_mfe_ms=p.t_mfe, time_to_mae_ms=p.t_mae)
+            fields = dict(mfe_pct=p.mfe, mae_pct=p.mae, first_hit=p.first_hit, first_hit_ms=p.first_hit_ms, time_to_mfe_ms=p.t_mfe, time_to_mae_ms=p.t_mae, last_move=p.last_move, last_observed_ms=p.last_observed_ms)
             for name in OUTCOME_HORIZONS_MS:
                 if name in p.rets:
                     fields[f"ret_{name}"] = p.rets[name]
             self.store.update_pulse_event(p.event_id, **fields)
+

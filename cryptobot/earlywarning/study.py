@@ -121,12 +121,11 @@ def score_windows(store: EWStore, symbol: str, cfg: EWConfig) -> EASModel:
     model = EASModel(cfg.weights_normalized(), min_obs=1)
     rows = store.windows(symbol)
     comps_list = [(r, components_from_features(r["features"])) for r in rows]
-    for r, c in comps_list:
-        if c:
-            model.add(_dist_key(symbol, r), c)
-    for r, c in comps_list:
+    for r, c in sorted(comps_list, key=lambda rc: rc[0]["t0_ms"]):
         eas, ranked = model.score(_dist_key(symbol, r), c)
         store.put_window(symbol, r["kind"], r["event_id"], r["t0_ms"], r["lookback_min"], r["features"], eas, ranked)
+        if c and (r["kind"] == "grid" or r["lookback_min"] != LEAD_LOOKBACK_MIN):
+            model.add(_dist_key(symbol, r), c)
     store.commit()
     return model
 
@@ -229,3 +228,4 @@ def pooled_compare(results: list[dict[str, Any]]) -> dict[str, Any]:
     leads = [l for r in results for l in r.get("lead_time", {}).get("by_event", []) if l is not None]
     pooled["lead_time"] = {"median_lead_min": float(np.median(leads)) if leads else None, "detected": len(leads), "events": pooled["events"]}
     return pooled
+

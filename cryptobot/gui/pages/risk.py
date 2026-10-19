@@ -77,6 +77,14 @@ class RiskPage(QWidget):
         self.dd.setSuffix("% from peak")
         self.dd.setToolTip("If equity falls this far below its best level, the bot closes everything and stops until you restart it.")
         lf.addRow("Total drawdown limit", self.dd)
+        self.trade_risk = QDoubleSpinBox()
+        self.trade_risk.setRange(0.1, 100)
+        self.trade_risk.setSuffix("% of budget")
+        lf.addRow("Maximum loss at stop per trade", self.trade_risk)
+        self.open_risk = QDoubleSpinBox()
+        self.open_risk.setRange(0.1, 100)
+        self.open_risk.setSuffix("% of budget")
+        lf.addRow("Maximum combined loss at stops", self.open_risk)
         left.addWidget(lg)
 
         pg_ = QGroupBox("Position protection (shared with the Strategy screen)")
@@ -139,6 +147,8 @@ class RiskPage(QWidget):
         self.per_pos.setValue(self.limits.per_position_pct)
         self.daily.setValue(self.limits.daily_loss_pct)
         self.dd.setValue(self.limits.max_drawdown_pct)
+        self.trade_risk.setValue(self.limits.risk_per_trade_pct)
+        self.open_risk.setValue(self.limits.max_open_risk_pct)
         raw = self.store.get_setting("strategy.config")
         cfg = StrategyConfig.model_validate(raw) if raw else StrategyConfig()
         self.stop_atr.setValue(cfg.risk.stop_atr_mult)
@@ -164,7 +174,7 @@ class RiskPage(QWidget):
 
     def _apply(self) -> None:
         self.limits = self.limits.model_copy(
-            update={"per_position_pct": self.per_pos.value(), "daily_loss_pct": self.daily.value(), "max_drawdown_pct": self.dd.value()}
+            update={"per_position_pct": self.per_pos.value(), "daily_loss_pct": self.daily.value(), "max_drawdown_pct": self.dd.value(), "risk_per_trade_pct": self.trade_risk.value(), "max_open_risk_pct": self.open_risk.value()}
         )
         self.store.set_setting("risk.limits", self.limits.model_dump())
         raw = self.store.get_setting("strategy.config")
@@ -179,7 +189,7 @@ class RiskPage(QWidget):
         self.store.audit("risk", "limits saved", **self.limits.model_dump())
         if self._running:
             self.ctrl.set_limits(self.limits)
-            self.msg.setText("Saved and applied to the running bot. Stop-loss changes apply to new positions; restart the bot to change the strategy timeframe.")
+            self.msg.setText("Budget and loss limits sent to the engine for validation. Strategy, stop, trail and slippage changes take effect after the current book is closed and restarted.")
         else:
             self.msg.setText("Saved. They take effect when you press START.")
 
@@ -196,3 +206,4 @@ class RiskPage(QWidget):
     def _on_state(self, ev: TraderStateEvent) -> None:
         self._running = ev.status != "stopped"
         self.s_status.setText(ev.status.replace("_", " "))
+

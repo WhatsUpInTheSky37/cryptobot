@@ -90,7 +90,7 @@ class Assessment:
         return d
 
 
-def assess(target_pct: float, stop_pct: float, costs: CostBreakdown, p_target: float | None, *, min_ev_pct: float, min_rr: float, min_target_cost_mult: float = 1.2) -> Assessment:
+def assess(target_pct: float, stop_pct: float, costs: CostBreakdown, p_target: float | None, *, min_ev_pct: float, min_rr: float, min_target_cost_mult: float = 1.2, p_stop: float | None = None, expiry_pct: float | None = None) -> Assessment:
     total = costs.total_pct
     net_target = target_pct - total
     net_stop = stop_pct + total
@@ -102,6 +102,10 @@ def assess(target_pct: float, stop_pct: float, costs: CostBreakdown, p_target: f
     if p_target is None:
         return Assessment(target_pct, stop_pct, costs, None, None, rr, net_target, net_stop, be, "insufficient_evidence", f"INSUFFICIENT HISTORICAL EVIDENCE (break-even win rate {be:.0%})")
     ev = p_target * target_pct - (1 - p_target) * stop_pct - total
+    if p_stop is not None and expiry_pct is not None:
+        stop_probability = min(1 - p_target, max(0.0, p_stop))
+        expiry_probability = max(0.0, 1 - p_target - stop_probability)
+        ev = p_target * target_pct - stop_probability * stop_pct + expiry_probability * expiry_pct - total
     if ev < min_ev_pct:
         return Assessment(target_pct, stop_pct, costs, p_target, ev, rr, net_target, net_stop, be, "ev_below_margin", f"EV {ev:+.3f}% below {min_ev_pct:+.3f}% (p={p_target:.0%}, break-even {be:.0%})")
     if rr < min_rr:
@@ -112,3 +116,4 @@ def assess(target_pct: float, stop_pct: float, costs: CostBreakdown, p_target: f
 def net_return_pct(gross_move_pct: float, costs: CostBreakdown) -> float:
     """Hypothetical net return of a round trip that moved ``gross_move_pct`` in our favour (mid to mid)."""
     return gross_move_pct - costs.total_pct
+

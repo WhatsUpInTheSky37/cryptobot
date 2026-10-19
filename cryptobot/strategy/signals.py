@@ -29,7 +29,9 @@ def compute_target_exposure(config: StrategyConfig, bars: BarArrays) -> tuple[np
     # nanmean would hide a NaN from one strategy; require all to be warmed up.
     all_nan = np.any(np.isnan(np.vstack(parts)), axis=0)
     exposure = np.where(all_nan, np.nan, exposure)
-    if config.vol_target:
+    pure_schedule = all(STRATEGIES[s.id].kind == "schedule" for s in config.strategies)
+    if config.vol_target and not pure_schedule:
         exposure = vol_target(exposure, bars, config.target_annual_vol, config.vol_window)
     exposure = np.clip(exposure, 0.0, 1.0)
     return exposure, warmup_index(exposure)
+

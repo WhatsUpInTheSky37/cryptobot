@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from cryptobot.core.events import BookEvent, ConnectionEvent, EWCandidateView, EWStatusEvent, HeartbeatEvent, TickEvent
+from cryptobot.core.events import BookEvent, BookSyncEvent, ConnectionEvent, EWCandidateView, EWStatusEvent, HeartbeatEvent, TickEvent
 from cryptobot.earlywarning.config import COMPONENTS, EWConfig
 from cryptobot.earlywarning.data import BinanceUSData
 from cryptobot.earlywarning.features import price_changes, window_features
@@ -72,6 +72,10 @@ class _Sym:
     updated_ms: int = 0
     breakout_level: float = 0.0
     retest_seen: bool = False
+    book_synced: bool = False
+    vol_pct: float = 0.0
+    retest_touch_ms: int = 0
+    breakout_confirmed: bool = False
 
 
 @dataclass
@@ -98,6 +102,7 @@ class _Position:
     took1: bool = False
     took2: bool = False
     highest: float = 0.0
+    realized_pnl: float = 0.0
 
 
 class EWPaperBook:
@@ -158,7 +163,7 @@ class EWPaperBook:
 
     def daily_loss_hit(self, now_ms: int) -> bool:
         self._roll_day(now_ms)
-        return self.realized_today + self.unrealized() <= -self.day_start_equity * self.cfg.risk.daily_loss_pct / 100.0
+        return self.equity() - self.day_start_equity <= -self.day_start_equity * self.cfg.risk.daily_loss_pct / 100.0
 
     def _reject(self, code: str) -> str:
         self.rejections[code] = self.rejections.get(code, 0) + 1
@@ -168,6 +173,8 @@ class EWPaperBook:
     def consider(self, sym: str, st: _Sym, target_net_pct: float | None, target_gross_pct: float | None, now_ms: int, quote_vol_1m: float) -> str:
         """Returns 'entered' or the rejection code."""
         r = self.cfg.risk
+        if sym.partition("/")[2] != self.cfg.scanner.quotes[0]:
+            return self._reject("wallet_quote_mismatch")
         if sym in self.positions:
             return self._reject("already_in_position")
         if st.state in NO_ENTRY_STATES:
@@ -178,6 +185,8 @@ class EWPaperBook:
             return self._reject("waiting_for_entry_state")
         if em == "C" and not st.retest_seen:
             return self._reject("waiting_for_retest")
+        if em == "B" and not st.breakout_confirmed:
+            return self._reject("waiting_for_closed_breakout")
         if st.data_status != "ok":
             return self._reject("data_invalid")
         if target_net_pct is None or target_net_pct <= 0:
@@ -195,7 +204,11 @@ class EWPaperBook:
             return self._reject("max_positions")
         eq = self.equity()
         stop_pct = self.cfg.exits.stop_pct
-        notional = min(eq * r.risk_per_trade_pct / 100.0 / (stop_pct / 100.0), self.cash, eq * 0.5)
+        if self.cfg.exits.method == "volatility":
+            stop_pct = max(stop_pct, st.vol_pct * 1.5)
+        # Include both commissions and the current spread in loss-at-stop sizing.
+        loss_pct = stop_pct + 2 * self.cfg.costs.fee_rate * 100 + spread + 2 * self.cfg.costs.base_slippage_pct
+        notional = min(eq * r.risk_per_trade_pct / 100.0 / (loss_pct / 100.0), self.cash / (1 + self.cfg.costs.fee_rate), eq * 0.5)
         liq_cap = quote_vol_1m * r.max_position_share_of_minute_volume
         if liq_cap < 5.0:
             return self._reject("insufficient_liquidity")
@@ -203,6 +216,8 @@ class EWPaperBook:
         slip = slip_pct(notional, quote_vol_1m, self.cfg)
         rt_cost = 2 * self.cfg.costs.fee_rate * 100 + spread + 2 * slip
         gross = target_gross_pct if target_gross_pct is not None else target_net_pct + rt_cost
+        if self.cfg.exits.method != "percentile":
+            gross = max(self.cfg.exits.fixed_target_pct, st.vol_pct * 2) if self.cfg.exits.method == "volatility" else self.cfg.exits.fixed_target_pct
         if gross - rt_cost <= 0:
             return self._reject("expected_net_not_positive")
         px = st.ask * (1 + slip / 100.0)
@@ -210,7 +225,7 @@ class EWPaperBook:
         fee = units * px * self.cfg.costs.fee_rate
         self.cash -= units * px + fee
         self.fees += fee
-        self.positions[sym] = _Position(sym, units, px, units * px + fee, px * (1 - stop_pct / 100.0), px * (1 + gross / 100.0), px * (1 + gross * self.cfg.exits.t2_multiple / 100.0), now_ms, 0, highest=px)
+        self.positions[sym] = _Position(sym, units, px, units * px + fee, px * (1 - stop_pct / 100.0), px * (1 + gross / 100.0), px * (1 + self.cfg.exits.fixed_target_pct * self.cfg.exits.t2_multiple / 100.0), now_ms, 0, highest=px)
         self.store.insert_paper_trade(book=self.BOOK, symbol=sym, side="buy", ts_ms=now_ms, price=st.ask, fill_price=px, amount=units, fee=fee, reason=f"entry {em} in {st.state}, EAS {st.eas:.0f}" if st.eas is not None else f"entry {em}")
         self.save()
         return "entered"
@@ -261,6 +276,7 @@ class EWPaperBook:
         pos.cost -= basis
         self._roll_day(now_ms)
         self.realized_today += pnl
+        pos.realized_pnl += pnl
         self.store.insert_paper_trade(book=self.BOOK, symbol=sym, side="sell", ts_ms=now_ms, price=st.bid, fill_price=px, amount=qty, fee=fee, pnl=pnl, reason=reason)
         if pos.units <= 1e-12 or reason in ("stop", "distribution warning", "time exit", "trailing", "target"):
             if pos.units > 1e-12:  # close the remainder at the same bid
@@ -272,8 +288,10 @@ class EWPaperBook:
                 self.fees += fee2
                 self.realized_today += pnl2
                 pnl += pnl2
+                pos.realized_pnl += pnl2
                 self.store.insert_paper_trade(book=self.BOOK, symbol=sym, side="sell", ts_ms=now_ms, price=st.bid, fill_price=px2, amount=rem, fee=fee2, pnl=pnl2, reason=reason + " (remainder)")
             self.positions.pop(sym, None)
+            pnl = pos.realized_pnl
             self.trades += 1
             if pnl > 0:
                 self.wins += 1
@@ -351,13 +369,14 @@ class EarlyWarningEngine:
         self.prev_snapshot = snapshot(tickers)
         self.last_scan_ms = now
         chosen = self.selected()
-        for s in chosen:
+        watched = sorted(set(chosen) | set(self.paper.positions) | {p.symbol for p in self.pending})
+        for s in watched:
             self.sym.setdefault(s, _Sym())
             self.sym[s].reasons = next((c.reasons for c in self.candidates if c.symbol == s), [])
         for s in list(self.sym):
-            if s not in chosen and s not in self.paper.positions:
+            if s not in watched:
                 self.sym.pop(s)
-        return chosen
+        return watched
 
     def ensure_history(self, symbol: str, days: int = 8) -> int:
         """Blocking REST: make sure the store has recent 1m candles (for baselines), then load them."""
@@ -407,6 +426,10 @@ class EarlyWarningEngine:
         elif isinstance(ev, BookEvent) and ev.symbol in self.sym and ev.synced:
             st = self.sym[ev.symbol]
             st.bid, st.ask, st.bid_depth, st.last_book_ms = ev.best_bid, ev.best_ask, ev.bid_depth_near, ev.ts_ms
+            st.book_synced = True
+        elif isinstance(ev, BookSyncEvent) and ev.symbol in self.sym:
+            if ev.status not in ("synced", "verified"):
+                self.sym[ev.symbol].book_synced = False
         elif isinstance(ev, HeartbeatEvent):
             self.tick_clock(ev.ts_ms)
 
@@ -443,13 +466,18 @@ class EarlyWarningEngine:
             st.data_status = "no trades yet"
         elif now_ms - st.last_tick_ms > sc.stale_s * 1000:
             st.data_status = f"trades stale ({(now_ms - st.last_tick_ms) // 1000}s)"
-        elif st.last_book_ms and now_ms - st.last_book_ms > sc.stale_s * 1000:
+        elif not st.book_synced or not st.last_book_ms:
+            st.data_status = "synchronized order book required"
+        elif now_ms - st.last_book_ms > sc.stale_s * 1000:
             st.data_status = "order book stale"
         elif st.bid > 0 and st.ask > 0 and (st.ask - st.bid) / ((st.ask + st.bid) / 2) * 100 > sc.max_spread_pct:
             st.data_status = f"spread {(st.ask - st.bid) / ((st.ask + st.bid) / 2) * 100:.2f}% too wide"
         else:
             st.data_status = "ok"
         k = self._klines(st, now_ms)
+        if len(k):
+            recent = k[-60:]
+            st.vol_pct = float(np.mean((recent["high"] - recent["low"]) / np.maximum(recent["close"], 1e-12) * 100))
         st.feats = window_features(k, now_ms - now_ms % 60_000, 60, self.cfg.score.baseline_minutes, None, large_pct=self.cfg.score.large_trade_pct) if len(k) else None
         comps = components_from_features(st.feats)
         if st.data_status == "ok" and comps is not None:
@@ -460,9 +488,13 @@ class EarlyWarningEngine:
         st.changes = price_changes(k, now_ms) if len(k) else {m: None for m in (5, 15, 30, 60)}
         new_state = classify(st.eas, st.comps, st.changes, imbalance=(st.feats or {}).get("imbalance"), rel_volume=(st.feats or {}).get("rel_volume"), data_ok=st.data_status == "ok", cfg=self.cfg.score)
         if new_state == "BREAKOUT DEVELOPING" and st.state != "BREAKOUT DEVELOPING":
-            st.breakout_level = max((b.high for ts, b in st.bars.items() if ts >= now_ms - 30 * 60_000), default=st.ask)
+            st.breakout_level = float(k["high"][-31:-1].max()) if len(k) >= 31 else st.ask
             st.retest_seen = False
-        if st.breakout_level and st.bid and st.bid <= st.breakout_level * 1.005 and st.state in ("BREAKOUT DEVELOPING", "SURGE ACTIVE"):
+            st.retest_touch_ms = 0
+        st.breakout_confirmed = bool(st.breakout_level and len(k) and float(k["close"][-1]) > st.breakout_level)
+        if st.breakout_level and st.bid and st.breakout_level * 0.995 <= st.bid <= st.breakout_level * 1.005 and st.state in ("BREAKOUT DEVELOPING", "SURGE ACTIVE"):
+            st.retest_touch_ms = st.retest_touch_ms or now_ms
+        if st.retest_touch_ms and len(k) and int(k["ts"][-1]) + 60_000 > st.retest_touch_ms and float(k["close"][-1]) > st.breakout_level:
             st.retest_seen = True
         if new_state != st.state:
             self.store.insert_transition(now_ms, sym, st.state, new_state, st.eas, st.data_status)
@@ -479,6 +511,8 @@ class EarlyWarningEngine:
         self._track(sym, st, now_ms)
 
     def _track(self, sym: str, st: _Sym, now_ms: int) -> None:
+        if not self.connected or not st.book_synced or not st.last_book_ms or now_ms - st.last_book_ms > self.cfg.scanner.stale_s * 1000:
+            return  # never simulate fills against a disconnected/stale quote
         price = st.bid or 0.0
         if price <= 0:
             return
@@ -603,3 +637,4 @@ class EarlyWarningEngine:
             except (asyncio.TimeoutError, Exception):  # noqa: BLE001
                 self._feed_task.cancel()
         self._feed_task, self._feed_stop = None, None
+

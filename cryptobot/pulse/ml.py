@@ -22,7 +22,7 @@ from cryptobot.pulse.config import OUTCOME_HORIZONS_MS
 from cryptobot.pulse.memory import KEYS
 from cryptobot.pulse.regime import REGIMES
 
-FEATURES: tuple[str, ...] = KEYS + tuple(f"regime_{r}" for r in REGIMES)
+FEATURES: tuple[str, ...] = KEYS + tuple(f"regime_{r}" for r in REGIMES) + ("target_pct", "stop_pct", "horizon_minutes", "is_short")
 MIN_EVENTS = 300
 MIN_POSITIVES = 50
 HORIZON_MS = max(OUTCOME_HORIZONS_MS.values())
@@ -40,6 +40,7 @@ def featurize(e: dict[str, Any]) -> list[float]:
     vec = [float(e.get(k) or 0.0) for k in KEYS]
     reg = e.get("regime") or "unknown"
     vec += [1.0 if reg == r else 0.0 for r in REGIMES]
+    vec += [float(e.get("target_pct") or 0), float(e.get("stop_pct") or 0), float(e.get("horizon_ms") or HORIZON_MS) / 60_000, float(e.get("direction") == "short")]
     return vec
 
 
@@ -144,9 +145,13 @@ def auc(y: np.ndarray, p: np.ndarray) -> float:
     pos, neg = p[y == 1], p[y == 0]
     if len(pos) == 0 or len(neg) == 0:
         return 0.5
-    order = np.argsort(np.concatenate([pos, neg]))
+    values = np.concatenate([pos, neg])
+    order = np.argsort(values, kind="stable")
     ranks = np.empty(len(order))
     ranks[order] = np.arange(1, len(order) + 1)
+    for value in np.unique(values):
+        tied = values == value
+        ranks[tied] = ranks[tied].mean()
     return float((ranks[: len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
 
 
@@ -193,8 +198,8 @@ def walk_forward(events: list[dict[str, Any]], *, n_folds: int = 4, min_train: i
                           int(rk.sum()), float(net[te][rk].mean()) if rk.any() else 0.0, float(y[te].mean()), int(ts[tr_end])))
     if not folds:
         return Report(False, "not enough data for a walk-forward split", n, int(y.sum()))
-    model_net = np.mean([f.model_net_pct for f in folds if f.model_trades > 0] or [0.0])
-    rule_net = np.mean([f.rule_net_pct for f in folds if f.rule_trades > 0] or [0.0])
+    model_net = sum(f.model_net_pct * f.model_trades for f in folds) / max(1, sum(f.model_trades for f in folds))
+    rule_net = sum(f.rule_net_pct * f.rule_trades for f in folds) / max(1, sum(f.rule_trades for f in folds))
     total_model_trades = sum(f.model_trades for f in folds)
     improved = total_model_trades >= 20 and model_net > rule_net and model_net > 0 and np.mean([f.auc for f in folds]) > 0.55
     reason = (f"out-of-sample net per trade: model {model_net:+.3f}% ({total_model_trades} trades) vs rules {rule_net:+.3f}%; mean AUC {np.mean([f.auc for f in folds]):.2f}")
@@ -244,3 +249,4 @@ def train(events: list[dict[str, Any]], **kw) -> PulseModel:
     X, y, _net, _ts, _rule = build_dataset(events)
     model = (kw.get("model_factory") or make_model)().fit(X, y)
     return PulseModel(model, report)
+

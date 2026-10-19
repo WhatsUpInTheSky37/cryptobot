@@ -98,7 +98,7 @@ class PaperTrader:
         self._tz = ZoneInfo(timezone)
         self.fallback_fee = fallback_fee
         self.emit = emit or (lambda ev: None)
-        self.trade_mode = f"PULSE-{mode.key}"
+        self.trade_mode = f"PULSE-{exchange_id}-{mode.key}"
         self.risk = RiskManager(RiskLimits(budget=mode.budget, per_position_pct=self.risk_cfg.per_position_pct, daily_loss_pct=self.risk_cfg.daily_loss_pct, max_drawdown_pct=100, timezone=timezone), RiskRules(stop_atr_mult=0), self.cost_cfg.base_slippage_pct)
         # state
         self.cash = mode.budget
@@ -128,9 +128,14 @@ class PaperTrader:
             "realized_today": self.realized_today, "consecutive_losses": self.consecutive_losses, "paused_until_ms": self.paused_until_ms, "trades": self.trades,
             "wins": self.wins, "losses": self.losses, "gross_profit": self.gross_profit, "gross_loss": self.gross_loss, "fees_paid": self.fees_paid,
             "equity_peak": self.equity_peak, "accepted": self.accepted, "rejected": self.rejected, "budget": self.mode.budget,
+            "exchange": self.exchange_id,
         }
 
     def restore(self, st: dict[str, Any] | None) -> None:
+        if st and st.get("exchange") not in (None, self.exchange_id):
+            raise ValueError("paper book belongs to another exchange")
+        if st and st.get("budget") != self.mode.budget and st.get("positions"):
+            raise ValueError("close the existing paper book before changing its budget")
         if not st or st.get("budget") != self.mode.budget:
             return  # a budget change starts a fresh book
         self.cash = float(st.get("cash", self.cash))
@@ -143,7 +148,7 @@ class PaperTrader:
             setattr(self, k, int(st.get(k, getattr(self, k))))
 
     def save(self) -> None:
-        self.store.set_setting(f"pulse.mode.{self.mode.key}.state", self.to_state())
+        self.store.set_setting(f"pulse.mode.{self.exchange_id}.{self.mode.key}.state", self.to_state())
 
     # ----------------------------------------------------------- marking
 
@@ -172,7 +177,7 @@ class PaperTrader:
         return self.open_risk_usd() / eq * 100.0 if eq > 0 else 0.0
 
     def daily_pnl_incl_open(self) -> float:
-        return self.realized_today + self.unrealized()
+        return self.equity() - self.day_start_equity
 
     def daily_loss_hit(self, now_ms: int) -> bool:
         self._roll_day(now_ms)
@@ -191,6 +196,8 @@ class PaperTrader:
         """Decide on a setup. ``estimate_fn(min_n)`` returns the memory estimate for this mode's
         evidence requirement; ``ml_p`` is a validated model probability (None if none)."""
         m = self.mode
+        if self.cfg.wallet_quote and setup.symbol.partition("/")[2] != self.cfg.wallet_quote:
+            return self._rej("wallet_quote_mismatch", f"this paper book is funded in {self.cfg.wallet_quote}")
         sc = setup.scores
         if not setup.health.ok:
             return self._rej("stale_data" if setup.health.status in ("stale_trades", "stale_book") else "insufficient_data", setup.health.detail or setup.health.label)
@@ -222,7 +229,7 @@ class PaperTrader:
         if (self.open_risk_usd() + risk_usd) / eq * 100.0 > self.risk_cfg.max_open_risk_pct + 1e-9:
             return self._rej("open_risk_limit", f"open risk {self.open_risk_pct():.2f}% + {self.risk_cfg.risk_per_trade_pct:g}% exceeds {self.risk_cfg.max_open_risk_pct:g}%")
         est = estimate_fn(m.min_similar)
-        move = expected_move_pct(setup.obs.vol_pct, self.cost_cfg.hold_minutes_for_move, est.expected_mfe_pct if est.sufficient else None)
+        move = expected_move_pct(setup.obs.vol_pct, self.cost_cfg.hold_minutes_for_move)
         target, stop = plan_exits(setup.obs.vol_pct, move, stop_vol_mult=self.cfg.stop_vol_mult, min_stop_pct=self.cfg.min_stop_pct, max_stop_pct=self.cfg.max_stop_pct,
                                   target_capture=self.cost_cfg.target_capture, max_target_pct=self.cost_cfg.max_target_pct, adaptive=self.cfg.adaptive,
                                   fixed_target=self.cfg.target_pct, fixed_stop=self.cfg.stop_pct)
@@ -236,12 +243,13 @@ class PaperTrader:
         costs = round_trip_costs(fee_rate, setup.obs.spread_pct, notional, setup.obs.bid_depth, setup.obs.ask_depth, band_pct=self.cost_cfg.impact_band_pct, base_slip_pct=self.cost_cfg.base_slippage_pct)
         p_src = "none"
         p: float | None = None
-        if m.use_ml and ml_p is not None:
+        if m.use_ml and ml_p is not None and est.sufficient:
             p, p_src = ml_p, "ml"
         elif est.sufficient:
             # conservative: the lower confidence bound, so thin evidence cannot look like a sure thing
             p, p_src = (est.ci_low if self.cfg.conservative_p and est.ci_low is not None else est.p_target), "memory"
-        a = assess(target, stop, costs, p, min_ev_pct=m.min_ev_pct, min_rr=m.min_rr, min_target_cost_mult=self.cfg.min_target_cost_mult)
+        a = assess(target, stop, costs, p, min_ev_pct=m.min_ev_pct, min_rr=m.min_rr, min_target_cost_mult=self.cfg.min_target_cost_mult,
+                   p_stop=est.p_stop if est.sufficient else None, expiry_pct=est.expiry_gross_pct if est.sufficient else None)
         if a.verdict != "ok":
             d = self._rej(a.verdict, a.reason if a.verdict != "insufficient_evidence" else est.note)
             d.assessment, d.estimate, d.notional, d.p_source = a, est, notional, p_src
@@ -258,9 +266,13 @@ class PaperTrader:
     def enter(self, setup: Setup, d: Decision, info: MarketInfo, decision_id: int, now_ms: int) -> PaperPosition | Rejection:
         assert d.accepted and d.assessment is not None
         a = d.assessment
+        if self.cost_cfg.fee_rate_override is not None:
+            from dataclasses import replace
+            info = replace(info, taker_fee=self.cost_cfg.fee_rate_override)
         ask = setup.obs.ask or setup.obs.mid
         units = d.notional / ask if ask > 0 else 0.0
         ctx = RiskContext(self.cash, self.in_use(), 0.0, 0.0, False, info, now_ms)
+        self.risk.slippage_pct = slippage_per_side_pct(d.notional, setup.obs.ask_depth, self.cost_cfg.impact_band_pct, self.cost_cfg.base_slippage_pct)
         res = self.risk.approve(OrderIntent(setup.symbol, "buy", units, ask, f"pulse {self.mode.key} entry", ask * (1 - a.stop_pct / 100)), ctx)
         if isinstance(res, Rejection):
             self.rejected += 1
@@ -303,6 +315,9 @@ class PaperTrader:
             self._exit(s, bid, depth, info_for(s), reason, now_ms)
 
     def _exit(self, symbol: str, bid: float, bid_depth: float, info: MarketInfo, reason: str, now_ms: int) -> tuple[str, float] | None:
+        if self.cost_cfg.fee_rate_override is not None:
+            from dataclasses import replace
+            info = replace(info, taker_fee=self.cost_cfg.fee_rate_override)
         pos = self.positions.pop(symbol, None)
         if pos is None:
             return None
@@ -357,3 +372,4 @@ class PaperTrader:
             "consecutive_losses": self.consecutive_losses, "paused_until_ms": self.paused_until_ms, "halted": self.daily_loss_hit(now_ms), "message": self.message,
             "positions": [dict(p.as_dict(), mark=self._mark_px(s, p.entry_px)) for s, p in self.positions.items()], "accepted": self.accepted, "rejected": self.rejected,
         }
+

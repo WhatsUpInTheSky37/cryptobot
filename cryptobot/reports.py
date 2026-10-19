@@ -13,6 +13,27 @@ Trade = dict[str, Any]
 TRADE_COLUMNS = ["id", "mode", "exchange", "symbol", "side", "ts_ms", "price", "fill_price", "amount", "fee", "fee_currency", "slippage", "reason", "pnl", "position_id", "order_id", "status"]
 
 
+def completed_trades(trades: list[Trade]) -> list[tuple[Trade, float]]:
+    """A partial reduction is realized P&L, but is not a completed position."""
+    amounts: dict[tuple, float] = defaultdict(float)
+    pnls: dict[tuple, float] = defaultdict(float)
+    out = []
+    for t in sorted(trades, key=lambda r: (int(r["ts_ms"]), int(r.get("id") or 0))):
+        pid = t.get("position_id")
+        if pid is None:
+            if t["side"] == "sell" and t.get("pnl") is not None:
+                out.append((t, float(t["pnl"])))
+            continue
+        key = (t.get("exchange"), t.get("mode"), pid)
+        amounts[key] += float(t["amount"]) * (1 if t["side"] == "buy" else -1)
+        if t["side"] == "sell":
+            pnls[key] += float(t.get("pnl") or 0)
+            closed = t.get("position_closed")
+            if closed is True or (closed is None and amounts[key] <= 1e-10):
+                out.append((t, pnls.pop(key, 0)))
+    return out
+
+
 def _period_key(ts_ms: int, period: str, tz: ZoneInfo) -> str:
     d = datetime.fromtimestamp(ts_ms / 1000, tz)
     if period == "daily":
@@ -33,10 +54,11 @@ def period_summary(trades: list[Trade], period: str = "daily", tz: str = "Americ
         b["fees"] += float(t.get("fee") or 0.0)
         b["volume"] += float(t.get("fill_price") or t.get("price") or 0.0) * float(t.get("amount") or 0.0)
         if t["side"] == "sell" and t.get("pnl") is not None:
-            b["round_trips"] += 1
             b["pnl"] += float(t["pnl"])
-            if float(t["pnl"]) > 0:
-                b["wins"] += 1
+    for closing, pnl in completed_trades(trades):
+        b = buckets[_period_key(int(closing["ts_ms"]), period, z)]
+        b["round_trips"] += 1
+        b["wins"] += int(pnl > 0)
     out = sorted(buckets.values(), key=lambda b: b["period"])
     for b in out:
         b["win_rate"] = b["wins"] / b["round_trips"] if b["round_trips"] else 0.0
@@ -47,10 +69,11 @@ def mode_stats(trades: list[Trade]) -> dict[str, Any]:
     sells = [t for t in trades if t["side"] == "sell" and t.get("pnl") is not None]
     slips = [float(t["slippage"]) for t in trades if t.get("slippage") is not None]
     fills = [t for t in trades if t.get("status") in (None, "filled", "partial")]
+    completed = completed_trades(trades)
     return {
         "fills": len(trades),
-        "round_trips": len(sells),
-        "win_rate": (sum(1 for t in sells if t["pnl"] > 0) / len(sells)) if sells else 0.0,
+        "round_trips": len(completed),
+        "win_rate": (sum(1 for _, pnl in completed if pnl > 0) / len(completed)) if completed else 0.0,
         "pnl": float(sum(t["pnl"] for t in sells)),
         "fees": float(sum(float(t.get("fee") or 0.0) for t in trades)),
         "avg_slippage_pct": (sum(slips) / len(slips)) if slips else 0.0,
@@ -85,13 +108,15 @@ def tax_lots(trades: list[Trade]) -> list[dict[str, Any]]:
     for t in sorted(trades, key=lambda t: (int(t["ts_ms"]), int(t.get("id") or 0))):
         sym = t["symbol"]
         px = float(t.get("fill_price") or t.get("price") or 0.0)
-        amt = float(t["amount"])
-        fee = float(t.get("fee") or 0.0)
+        gross_amount = float(t["amount"])
+        base_fee = float(t.get("base_fee") or 0)
+        amt = gross_amount - base_fee if t["side"] == "buy" else gross_amount + base_fee
+        fee = float(t["quote_fee"] if t.get("quote_fee") is not None else t.get("fee") or 0) + float(t.get("external_fee_value") or 0)
         if t["side"] == "buy":
-            lots[sym].append({"ts": int(t["ts_ms"]), "amount": amt, "cost": px * amt + fee})
+            lots[sym].append({"ts": int(t["ts_ms"]), "amount": amt, "cost": px * gross_amount + fee})
             continue
         remaining = amt
-        proceeds_total = px * amt - fee
+        proceeds_total = px * gross_amount - fee
         while remaining > 1e-12 and lots[sym]:
             lot = lots[sym][0]
             take = min(remaining, lot["amount"])
@@ -126,3 +151,4 @@ def export_tax_csv(trades: list[Trade], path: Path | str) -> int:
         w.writeheader()
         w.writerows(rows)
     return len(rows)
+

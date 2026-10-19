@@ -274,8 +274,9 @@ def test_memory_requires_evidence_spanning_market_time():
     m = MarketMemory(store, k=10, min_n=5, min_span_ms=24 * 3_600_000)
     vec = [90, 90, 90, 90, 90, 50, 50, 50, 50, 0.2, 0.01, 0.5]
     for i in range(8):  # eight independent setups, all inside one afternoon
-        m.add(MemoryRow(f"C{i}/USD", 1_750_000_000_000 + i * 600_000, "long", "range", vec, True, False, 0.1, 60_000, 0.4))
+        m.add(MemoryRow(f"C{i}/USD", 1_750_000_000_000 + i * 3_600_000, "long", "range", vec, True, False, 0.1, 60_000, 0.4))
     est = m.estimate("long", dict(zip(("f", "a", "w", "r", "c", "acc", "vpr", "sx", "vx", "vol_pct", "spread_pct", "imbalance"), vec)))
     assert not est.sufficient and "span only" in est.note and "need 24 h" in est.note
     m.add(MemoryRow("C9/USD", 1_750_000_000_000 + 30 * 3_600_000, "long", "range", vec, True, False, 0.1, 60_000, 0.4))
     assert m.estimate("long", dict(zip(("f", "a", "w", "r", "c", "acc", "vpr", "sx", "vx", "vol_pct", "spread_pct", "imbalance"), vec))).sufficient
+

@@ -16,7 +16,7 @@ def ctx(cash=100.0, in_use=0.0, basis=0.0, units=0.0, halted=False, info=INFO):
 
 
 def rm(budget=100.0, per_pos=100.0, stop=2.0):
-    return RiskManager(RiskLimits(budget=budget, per_position_pct=per_pos), RiskRules(stop_atr_mult=stop))
+    return RiskManager(RiskLimits(budget=budget, per_position_pct=per_pos, risk_per_trade_pct=100, max_open_risk_pct=100), RiskRules(stop_atr_mult=stop))
 
 
 def buy(amount, price=50_000.0, stop=49_000.0, reason="t"):
@@ -64,7 +64,8 @@ def test_halted_blocks_buys_but_allows_sells():
 def test_sell_closes_dust_and_never_exceeds_units():
     r = rm()
     a = r.approve(OrderIntent(S, "sell", 1.0, 50_000, "exit"), ctx(units=0.0012345678))
-    assert isinstance(a, Approval) and a.amount == 0.0012345678
+    assert isinstance(a, Approval) and a.amount == 0.00123
+    r.consume(a.token)  # a pending full close correctly reserves the inventory
     b = r.approve(OrderIntent(S, "sell", 0.0005, 50_000, "reduce"), ctx(units=0.0012345678))
     assert isinstance(b, Approval) and b.amount == pytest.approx(0.0005)
 
@@ -73,7 +74,7 @@ def test_approval_token_is_single_use_and_executor_refuses_forgeries():
     r = rm()
     a = r.approve(buy(0.001), ctx())
     ex = SimulatedExecutor(r, slippage_pct=0.1)
-    f = ex.execute(a, 50_000.0, 123)
+    f = ex.execute(a, 50_000.0, 1123)
     assert isinstance(f, Fill) and f.price == pytest.approx(50_050.0) and f.fee == pytest.approx(f.notional * 0.006)
     with pytest.raises(PermissionError):
         ex.execute(a, 50_000.0, 124)  # reuse
@@ -121,7 +122,7 @@ def test_read_only_exchange_blocks_every_order_method():
 )
 def test_money_at_risk_never_exceeds_budget(actions, per_pos):
     budget = 100.0
-    r = RiskManager(RiskLimits(budget=budget, per_position_pct=per_pos), RiskRules(stop_atr_mult=0))
+    r = RiskManager(RiskLimits(budget=budget, per_position_pct=per_pos, risk_per_trade_pct=100, max_open_risk_pct=100), RiskRules(stop_atr_mult=0))
     ex = SimulatedExecutor(r, slippage_pct=0.05)
     led = Ledger(cash=budget)
     info = MarketInfo(S, taker_fee=0.006, min_amount=0.0, min_cost=0.0, amount_step=0.0)
@@ -141,3 +142,4 @@ def test_money_at_risk_never_exceeds_budget(actions, per_pos):
         assert led.cash >= -1e-6
         assert led.in_use() <= budget + 1e-6
         assert led.position(S).basis <= budget * per_pos / 100 + 1e-6
+

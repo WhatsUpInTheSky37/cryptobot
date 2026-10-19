@@ -31,7 +31,14 @@ def main() -> None:
     app.setOrganizationName("CryptoBot")
     apply_theme(app)
 
-    from PySide6.QtCore import QTimer
+    from PySide6.QtCore import QLockFile, QTimer
+    from PySide6.QtWidgets import QMessageBox
+
+    instance_lock = QLockFile(str(paths.data_dir / "cryptobot.lock"))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(None, "CryptoBot is already running", "Use the existing CryptoBot window or tray icon. A second engine cannot own the same trading book.")
+        return
 
     from cryptobot.gui.pages.coins import selected_symbols
     from cryptobot.gui.wizard import SetupWizard
@@ -104,3 +111,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

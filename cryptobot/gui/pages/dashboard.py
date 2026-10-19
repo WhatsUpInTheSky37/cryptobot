@@ -333,9 +333,9 @@ class DashboardPage(QWidget):
         if ev.status != "stopped":
             self._set_toggle(ev.mode)
         running = ev.status in ("running", "halted_daily", "halted_drawdown")
-        self.start_btn.setEnabled(not running or ev.status == "halted_drawdown")
+        self.start_btn.setEnabled(not running or ev.status in ("paused", "halted_drawdown"))
         self.stop_btn.setEnabled(running)
-        self.start_btn.setText("▶  RESTART" if ev.status == "halted_drawdown" else "▶  START")
+        self.start_btn.setText("▶  RESUME" if ev.status == "paused" else "▶  RESTART" if ev.status == "halted_drawdown" else "▶  START")
         exch = EXCHANGES.get(ev.exchange, {}).get("name", ev.exchange)
         if ev.status == "running":
             nxt = datetime.fromtimestamp(ev.next_decision_ms / 1000).strftime("%a %H:%M") if ev.next_decision_ms else "—"
@@ -424,3 +424,4 @@ class DashboardPage(QWidget):
         self._draw_equity()
         for t in reversed(self.store.load_trades(None, limit=50)):
             self._add_row(t["ts_ms"], t["mode"], t["side"].upper(), f"{t['symbol']} {t['amount']:.6f} @ {_px(t.get('fill_price') or t['price'])} · fee {t['fee']:.4f} · {t['reason']}", t["pnl"], GREEN if t["side"] == "buy" else RED)
+

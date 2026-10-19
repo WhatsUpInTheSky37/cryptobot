@@ -1,5 +1,7 @@
 name: build
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
     tags: ["v*"]
@@ -11,10 +13,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - uses: astral-sh/setup-uv@v3
       - name: Qt runtime libraries (so the offscreen GUI tests run instead of skipping)
         run: sudo apt-get update -q && sudo apt-get install -y -q libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 libxcb-cursor0
-      - run: pip install -e ".[dev]"
-      - run: QT_QPA_PLATFORM=offscreen pytest -q
+      - run: uv sync --frozen --extra dev --python 3.12
+      - run: QT_QPA_PLATFORM=offscreen uv run --frozen --extra dev pytest -q
   mac:
     needs: test
     runs-on: macos-latest
@@ -40,6 +43,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - uses: astral-sh/setup-uv@v3
       - run: choco install innosetup -y --no-progress
       - name: Build Windows installer
         shell: pwsh
@@ -59,3 +63,4 @@ jobs:
           Get-Content build.log -Tail 5
       - uses: actions/upload-artifact@v4
         with: { name: CryptoBot-Windows, path: dist/CryptoBot-Setup-*.exe }
+

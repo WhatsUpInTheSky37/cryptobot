@@ -14,6 +14,7 @@ from cryptobot.earlywarning.config import EWConfig
 from cryptobot.earlywarning.paper import ENTRY_METHODS, EXIT_METHODS, simulate_trade, summarize
 from cryptobot.earlywarning.store import EWStore
 from cryptobot.earlywarning.targets import _dedupe, collect_setups
+from cryptobot.earlywarning.portfolio import replay
 
 
 def run_methods(store: EWStore, symbols: list[str], cfg: EWConfig, *, lookback_min: int = 60, spreads: dict[str, float | None] | None = None) -> dict[str, Any]:
@@ -39,6 +40,9 @@ def run_methods(store: EWStore, symbols: list[str], cfg: EWConfig, *, lookback_m
         return {"n_setups": 0, "results": {}, "note": "no setups reached the EAS setup level"}
     cut = int(len(setups) * cfg.train_share)
     train, test = setups[:cut], setups[cut:]
+    if test:
+        cutoff = test[0]["t0_ms"] - max(cfg.horizons_min) * 60_000
+        train = [s for s in train if s["t0_ms"] < cutoff]
     h = str(max(cfg.horizons_min))
     tr_mfe = [s["outcomes"][int(h)]["mfe_pct"] for s in train if int(h) in s["outcomes"]]
     pct_target = float(np.quantile(tr_mfe, cfg.targets.target_quantile)) if len(tr_mfe) >= 10 else None
@@ -48,15 +52,9 @@ def run_methods(store: EWStore, symbols: list[str], cfg: EWConfig, *, lookback_m
             key = f"{em}/{xm}"
             res = {}
             for name, subset in (("train", train), ("test", test)):
-                trades = []
-                for s in subset:
-                    k, tr = data[s["symbol"]]
-                    vol = float(np.mean((k["high"] - k["low"]) / np.maximum(k["close"], 1e-12) * 100)) if len(k) else None
-                    t = simulate_trade(k, tr, s["symbol"], s["t0_ms"], em, xm, cfg_for.get(s["symbol"], cfg), target_pct=pct_target, vol_pct=vol, budget=cfg.risk.budget)
-                    if t is not None:
-                        trades.append(t)
-                res[name] = summarize(trades, cfg.risk.budget)
+                res[name], trades = replay(subset, data, cfg, em, xm, pct_target, cfg_for)
                 res[name]["by_symbol"] = {sym: summarize([t for t in trades if t.symbol == sym], cfg.risk.budget)["net_pct"] for sym in {t.symbol for t in trades}}
             results[key] = res
-    return {"n_setups": len(setups), "n_train": len(train), "n_test": len(test), "percentile_target_pct": pct_target, "results": results,
+    return {"n_setups": len(setups), "n_train": len(train), "n_test": len(test), "n_embargoed": len(setups) - len(train) - len(test), "percentile_target_pct": pct_target, "results": results,
             "note": "test = chronologically later setups never used to set anything; compare methods on 'test' only"}
+

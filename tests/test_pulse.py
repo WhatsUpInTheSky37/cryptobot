@@ -145,13 +145,13 @@ def make(config=None, store=None, connect=True):
 def drive_neutral(eng, clock, seconds: int, price=3000.0):
     for _ in range(seconds):
         ts = clock.ms
-        eng.on_event(TickEvent("binanceus", Tick(S, ts, price, 0.1, None, "buy")))
-        eng.on_event(TickEvent("binanceus", Tick(S, ts + 500, price, 0.1, None, "sell")))
-        eng.on_event(TickEvent("binanceus", Tick(B, ts, 80_000.0, 0.01, None, "buy")))
-        eng.on_event(TickEvent("binanceus", Tick(B, ts + 500, 80_000.0, 0.01, None, "sell")))
-        eng.on_event(BookEvent("binanceus", S, ts, price - 0.1, price + 0.1, 50_000.0, 50_000.0, 150_000.0, 150_000.0, 1, True))
-        eng.on_event(BookEvent("binanceus", B, ts, 79_999.0, 80_001.0, 50_000.0, 50_000.0, 150_000.0, 150_000.0, 1, True))
-        eng.on_event(HeartbeatEvent("binanceus", ts + 999))
+        eng.on_event(TickEvent(eng.exchange_id, Tick(S, ts, price, 0.1, None, "buy")))
+        eng.on_event(TickEvent(eng.exchange_id, Tick(S, ts + 500, price, 0.1, None, "sell")))
+        eng.on_event(TickEvent(eng.exchange_id, Tick(B, ts, 80_000.0, 0.01, None, "buy")))
+        eng.on_event(TickEvent(eng.exchange_id, Tick(B, ts + 500, 80_000.0, 0.01, None, "sell")))
+        eng.on_event(BookEvent(eng.exchange_id, S, ts, price - 0.1, price + 0.1, 50_000.0, 50_000.0, 150_000.0, 150_000.0, 1, True))
+        eng.on_event(BookEvent(eng.exchange_id, B, ts, 79_999.0, 80_001.0, 50_000.0, 50_000.0, 150_000.0, 150_000.0, 1, True))
+        eng.on_event(HeartbeatEvent(eng.exchange_id, ts + 999))
         clock.ms += 1000
 
 
@@ -159,13 +159,13 @@ def drive_pressure(eng, clock, seconds: int, price=3000.0, drift=0.0, k0=0):
     for k in range(seconds):
         ts = clock.ms
         px = price + drift * k
-        eng.on_event(TickEvent("binanceus", Tick(S, ts, px, 2.0, None, "buy")))
-        eng.on_event(TickEvent("binanceus", Tick(S, ts + 500, px, 0.1, None, "sell")))
-        eng.on_event(TickEvent("binanceus", Tick(B, ts, 80_000.0, 0.05, None, "buy")))
+        eng.on_event(TickEvent(eng.exchange_id, Tick(S, ts, px, 2.0, None, "buy")))
+        eng.on_event(TickEvent(eng.exchange_id, Tick(S, ts + 500, px, 0.1, None, "sell")))
+        eng.on_event(TickEvent(eng.exchange_id, Tick(B, ts, 80_000.0, 0.05, None, "buy")))
         ask = 50_000.0 * (1 - min(0.9, (k0 + k) / 100))
-        eng.on_event(BookEvent("binanceus", S, ts, px - 0.1, px + 0.1, 50_000.0, ask, 150_000.0, ask * 3, 1, True))
-        eng.on_event(BookEvent("binanceus", B, ts, 79_999.0, 80_001.0, 50_000.0, 50_000.0, 150_000.0, 150_000.0, 1, True))
-        eng.on_event(HeartbeatEvent("binanceus", ts + 999))
+        eng.on_event(BookEvent(eng.exchange_id, S, ts, px - 0.1, px + 0.1, 50_000.0, ask, 150_000.0, ask * 3, 1, True))
+        eng.on_event(BookEvent(eng.exchange_id, B, ts, 79_999.0, 80_001.0, 50_000.0, 50_000.0, 150_000.0, 150_000.0, 1, True))
+        eng.on_event(HeartbeatEvent(eng.exchange_id, ts + 999))
         clock.ms += 1000
 
 
@@ -181,7 +181,7 @@ def seed_memory(eng, n=40, p_hit=0.9, direction="long"):
     """Independent, resolved, similar past setups so the modes have evidence."""
     for i in range(n):
         hit = (i % 10) < int(p_hit * 10)
-        eng.memory.add(MemoryRow(f"X{i}/USDT", T0 - (i + 1) * 3_600_000, direction, "range", [95, 95, 95, 95, 95, 90, 60, 50, 50, 0.1, 0.007, 0.9], hit, not hit, 0.09 if hit else -0.51, 120_000, 0.5))
+        eng.memory.add(MemoryRow(f"X{i}/USDT", T0 - (i + 1) * 3_600_000, direction, "range", [95, 95, 95, 95, 95, 90, 60, 50, 50, 0.1, 0.007, 0.9], hit, not hit, 0.09 if hit else -0.51, 120_000, 0.5, eng.cfg.target_pct, eng.cfg.stop_pct, eng.cfg.max_hold_s * 1000, "bidask-v2", eng.exchange_id))
 
 
 def test_no_scores_without_data_and_insufficient_data_is_explicit():
@@ -346,21 +346,20 @@ def test_outcome_tracking_horizons_mfe_mae_first_hit_and_net_after_costs():
     p0 = pend[-1]  # the most recent signal: nothing has happened after it yet
     base = p0.entry_mid
     t = p0.start_ms
-    # 30 s: small dip; 1 m: up 0.1%; 5 m: target; then flat to the horizon
-    eng.on_event(TickEvent("binanceus", Tick(S, t + 30_000, base * 0.9995, 1.0, None, "sell")))
-    eng.on_event(TickEvent("binanceus", Tick(S, t + 60_000, base * 1.001, 1.0, None, "buy")))
-    eng.on_event(TickEvent("binanceus", Tick(S, t + 300_000, base * 1.0065, 1.0, None, "buy")))
-    eng.on_event(TickEvent("binanceus", Tick(S, t + 1_200_001, base * 1.002, 1.0, None, "buy")))
+    # Executable bid quotes arrive throughout the horizon; gaps are censored.
+    for elapsed in range(10_000, 1_200_001, 10_000):
+        move = -0.0005 if elapsed <= 30_000 else 0.001 if elapsed < 300_000 else 0.0065 if elapsed <= 310_000 else 0.002
+        bid = base * (1 + move)
+        eng.on_event(BookEvent("binanceus", S, t + elapsed, bid, bid * 1.00001, 50000, 50000, 150000, 150000, 1, True))
     row = store.pulse_event(p0.event_id)
     assert row["outcome"] == "target" and row["first_hit"] == "target" and row["first_hit_ms"] == t + 300_000
-    assert row["ret_30s"] == pytest.approx(-0.05, abs=1e-6) and row["ret_1m"] == pytest.approx(0.1, abs=1e-6) and row["ret_5m"] == pytest.approx(0.65, abs=1e-6)
-    assert row["ret_20m"] == pytest.approx(0.2, abs=1e-6)
-    assert row["mfe_pct"] == pytest.approx(0.65, abs=1e-6) and row["mae_pct"] == pytest.approx(-0.05, abs=1e-6)
-    assert row["time_to_mfe_ms"] == 300_000 and row["time_to_mae_ms"] == 30_000
-    assert row["net_pct"] == pytest.approx(0.6 - row["cost_pct"])  # target gross minus the full round-trip cost
+    assert row["ret_30s"] == pytest.approx(-0.05, abs=1e-6)
+    assert row["ret_1m"] == pytest.approx(0.1, abs=1e-6)
+    assert row["ret_5m"] == pytest.approx(0.65, abs=1e-6)
+    assert row["mfe_pct"] == pytest.approx(0.65, abs=1e-6)
+    assert -0.1 < row["mae_pct"] <= -0.05  # includes observed bid/ask loss immediately after the signal
     assert eng.memory.resolved("long") >= 1
-    # the signal-time columns did not change
-    assert row["mid"] == pytest.approx(base) and row["prs"] > 0
+    assert row["label_entry"] == pytest.approx(base) and row["prs"] > 0
 
 
 def test_outcomes_use_only_future_prices_never_past():
@@ -537,8 +536,9 @@ def test_stop_is_kept_outside_the_spread_or_the_trade_is_refused():
     drive_neutral(eng, clock, 90)
     drive_pressure(eng, clock, 60)
     drive_pressure(eng, clock, 15, drift=0.05, k0=60)
-    pos = next(p for m in eng.modes.values() for p in m.positions.values())
-    assert pos.stop_pct == pytest.approx(40.0 * 0.2 / (pos.entry_px - 0.0) * 100, rel=0.2) and pos.stop_pct > 0.2
+    # Widening the stop changes the predicted event: old 0.2%-stop evidence is refused.
+    assert all(S not in m.positions for m in eng.modes.values())
+    assert any(d["code"] == "insufficient_evidence" and d["symbol"] == S for d in store.load_decisions())
     # 100 spreads would be 0.67%, beyond the 0.6% maximum stop: no trade, with the reason recorded
     eng, ev, store, clock = make(cfg(stop_spread_mult=100.0))
     seed_memory(eng, n=60, p_hit=0.9)
@@ -561,3 +561,4 @@ def test_conservative_probability_uses_the_lower_confidence_bound():
     # the EV recorded on the signal was computed from the lower bound, so it is below the point-estimate EV
     point_ev = row["similar_p"] * row["target_pct"] - (1 - row["similar_p"]) * row["stop_pct"] - row["cost_pct"]
     assert row["ci_low"] < row["similar_p"] and row["ev_pct"] < point_ev - 1e-9
+

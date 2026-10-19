@@ -70,11 +70,13 @@ def group_outcomes(events: list[dict[str, Any]], key: str) -> list[dict[str, Any
         res = [r for r in rows if r.get("outcome") in ("target", "stop", "expired")]
         hits = sum(1 for r in res if (r.get("first_hit") or r.get("outcome")) == "target")
         nets = [float(r["net_pct"]) for r in res if r.get("net_pct") is not None]
+        mfes = [r["mfe_pct"] for r in res if r.get("mfe_pct") is not None]
+        maes = [r["mae_pct"] for r in res if r.get("mae_pct") is not None]
         out.append({
             key: g, "signals": len(rows), "resolved": len(res), "hit_rate": hits / len(res) if res else None,
             "avg_net_pct": sum(nets) / len(nets) if nets else None, "sum_net_pct": sum(nets) if nets else 0.0,
-            "avg_mfe_pct": float(np.mean([r["mfe_pct"] for r in res if r.get("mfe_pct") is not None])) if res else None,
-            "avg_mae_pct": float(np.mean([r["mae_pct"] for r in res if r.get("mae_pct") is not None])) if res else None,
+            "avg_mfe_pct": float(np.mean(mfes)) if mfes else None,
+            "avg_mae_pct": float(np.mean(maes)) if maes else None,
         })
     return out
 
@@ -139,3 +141,4 @@ def decision_summary(decisions: list[dict[str, Any]]) -> dict[str, dict[str, int
     for d in decisions:
         out[d["mode"]]["accepted" if d.get("accepted") else "rejected"] += 1
     return dict(out)
+
