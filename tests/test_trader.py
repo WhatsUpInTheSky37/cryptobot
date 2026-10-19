@@ -66,7 +66,7 @@ def make(store=None, limits=None, strategy=None, clock=None, **kw):
     store = store or Store(":memory:")
     events = []
     clock = clock or Clock(T0)
-    t = Trader(store, events.append, "binanceus", [S], strategy or cfg(), limits or RiskLimits(budget=100, per_position_pct=100, daily_loss_pct=5, max_drawdown_pct=20), clock=clock, **kw)
+    t = Trader(store, events.append, "binanceus", [S], strategy or cfg(), limits or RiskLimits(budget=100, per_position_pct=100, daily_loss_pct=5, max_drawdown_pct=20, risk_per_trade_pct=100, max_open_risk_pct=100), clock=clock, **kw)
     t.start()
     t.on_event(MarketInfoEvent("binanceus", S, 0.006, 0.004, 0.00001, 5.0, 0.00001, 0.01))
     return t, events, store, clock
@@ -252,3 +252,4 @@ def test_test_mode_cannot_send_a_real_order(monkeypatch):
 def test_buy_mode_requires_an_authenticated_exchange():
     with pytest.raises(ValueError, match="authenticated exchange"):
         Trader(Store(":memory:"), lambda e: None, "binanceus", [S], cfg(), RiskLimits(), mode=Mode.BUY)
+

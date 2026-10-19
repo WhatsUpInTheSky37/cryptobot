@@ -62,10 +62,10 @@ def _candidates(config: StrategyConfig) -> list[StrategyConfig]:
     return out
 
 
-def _run(cfg: StrategyConfig, bars: BarArrays, budget: float, costs: Costs, start: int, end: int):
+def _run(cfg: StrategyConfig, bars: BarArrays, budget: float, costs: Costs, start: int, end: int, limits=None):
     sub = bars.head(end)
     expo, warm = compute_target_exposure(cfg, sub)
-    sim = simulate(sub, expo, budget, costs, cfg.effective_risk(), start_index=max(start, warm))
+    sim = simulate(sub, expo, budget, costs, cfg.effective_risk(), start_index=max(start, warm), liquidate_end=True, limits=limits)
     m = compute_metrics(sim.equity[start:end], budget, bars.periods_per_year, sim.trades, sim.units[start:end], sim.fees_paid)
     return sim, m
 
@@ -77,6 +77,7 @@ def walk_forward(
     costs: Costs,
     folds: int = 4,
     min_is_bars: int = 200,
+    limits=None,
 ) -> WalkForwardResult:
     n = len(bars)
     res = WalkForwardResult()
@@ -92,13 +93,13 @@ def walk_forward(
         oos_start, oos_end = is_end, (min_is_bars + (k + 1) * seg) if k < folds - 1 else n
         scored = []
         for cand in cands:
-            _, m = _run(cand, bars, budget, costs, is_start, is_end)
+            _, m = _run(cand, bars, budget, costs, is_start, is_end, limits)
             scored.append((cand, m))
         enough = [x for x in scored if x[1].trades >= 3 or x[0].strategies[0].id == "dca"]
         pool = enough or scored
         best, best_m = max(pool, key=lambda x: x[1].cagr)
-        sim_oos, m_oos = _run(best, bars, budget, costs, oos_start, oos_end)
-        _, m_user = _run(config, bars, budget, costs, oos_start, oos_end)
+        sim_oos, m_oos = _run(best, bars, budget, costs, oos_start, oos_end, limits)
+        _, m_user = _run(config, bars, budget, costs, oos_start, oos_end, limits)
         seg_eq = sim_oos.equity[oos_start:oos_end]
         prev = stitched[oos_start - 1] if k and np.isfinite(stitched[oos_start - 1]) else budget
         stitched[oos_start:oos_end] = seg_eq * (prev / budget)  # chain folds into one curve
@@ -115,3 +116,4 @@ def walk_forward(
     res.mean_oos_cagr = float(np.mean([f.oos_cagr for f in res.folds]))
     res.params_stable = len(set(chosen)) <= max(1, folds // 2)
     return res
+

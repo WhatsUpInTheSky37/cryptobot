@@ -3,7 +3,8 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 if (-not (Test-Path ".venv\Scripts\python.exe")) { py -3.12 -m venv .venv }
-.\.venv\Scripts\python.exe -m pip install -q -e ".[dev,build]"
+uv sync --frozen --extra dev --extra build --python 3.12
+if ($LASTEXITCODE -ne 0) { throw "Locked dependency sync failed" }
 .\.venv\Scripts\python.exe packaging\make_icons.py
 Remove-Item -Recurse -Force build, dist\CryptoBot -ErrorAction SilentlyContinue
 .\.venv\Scripts\pyinstaller.exe --noconfirm --clean packaging\cryptobot.spec
@@ -22,3 +23,4 @@ if ($isccPath) {
 } else {
   Write-Host "Inno Setup not found: built dist\CryptoBot\CryptoBot.exe (folder app). Install Inno Setup 6 and rerun for a one-click installer."
 }
+

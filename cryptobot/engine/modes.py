@@ -30,13 +30,15 @@ def simulation_stats(store: Store, now_ms: int) -> TestStats:
     started = store.get_setting("test.started_ms")
     days = (now_ms - started) / DAY_MS if started else 0.0
     trades = store.load_trades("TEST", limit=100_000)
+    from cryptobot.reports import completed_trades
     sells = [t for t in trades if t["side"] == "sell" and t["pnl"] is not None]
-    wins = sum(1 for t in sells if t["pnl"] > 0)
+    completed = completed_trades(trades)
+    wins = sum(1 for _, pnl in completed if pnl > 0)
     eq = [e for _t, e in store.load_equity("TEST", limit=100_000)]
     return TestStats(
         max(0.0, days),
-        len(sells),
-        wins / len(sells) if sells else 0.0,
+        len(completed),
+        wins / len(completed) if completed else 0.0,
         float(sum(t["pnl"] for t in sells)),
         float(sum(t["fee"] for t in trades)),
         max_drawdown(np.array(eq)) if eq else 0.0,
@@ -61,3 +63,4 @@ def buy_gate(store: Store, now_ms: int, budget: float, has_key: bool, key_can_tr
     if in_first_month and budget > FIRST_MONTH_CAP:
         reasons.append(f"For the first {FIRST_MONTH_DAYS} days of BUY mode the budget may not exceed ${FIRST_MONTH_CAP:,.0f}. Lower it on the Risk screen.")
     return not reasons, reasons, stats
+

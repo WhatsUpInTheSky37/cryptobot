@@ -217,6 +217,7 @@ def test_top_markets_rank_by_quote_volume_and_export_csv(synth, tmp_path):
     assert data.top_markets(2) == ["MXC/USDT", "POND/USD"]  # BTC/USD has no ticker: skipped; COMP = 5,000 ties and sorts after POND
     assert data.top_markets(5) == ["MXC/USDT", "POND/USD", "COMP/USD"]
     cfg = EWConfig(days=12)
+    cfg.targets.setup_eas = 0
     cfg.seed_symbols = ["POND/USD"]
     research(store, cfg, demo=True, progress=lambda m: None)
     files = export_csv(store, tmp_path / "out")
@@ -360,7 +361,7 @@ def test_walk_forward_targets_validates_only_with_coverage_and_net_positive():
     for i in range(120):
         mfe = float(rng.uniform(2.0, 6.0))  # every setup moves at least 2%: p25 ≈ 3% gross
         setups.append({"symbol": "A/USD", "t0_ms": T0 + i * 3_600_000, "eas": 70, "kind": "grid", "vec": [50 + rng.normal(0, 10) for _ in COMPONENTS],
-                       "outcomes": {h: {"hit": mfe >= 3.0, "stopped": False, "mfe_pct": mfe, "mae_pct": -0.5, "entry": 1.0, "close_pct": 1.0, "bars": h} for h in cfg.horizons_min}})
+                       "outcomes": {h: {"hit": mfe >= 3.0, "stopped": False, "mfe_pct": mfe, "mae_pct": -0.5, "entry": 1.0, "close_pct": 1.0, "bars": h, "high_path": [mfe / 100] * h, "low_path": [-0.005] * h} for h in cfg.horizons_min}})
     rep = walk_forward_targets(setups, cfg)
     h60 = rep["horizons"]["60"]
     assert h60["n_oos"] >= 20 and h60["reliable"] and h60["coverage"] >= 0.7 and h60["tradeable"] and h60["target_net_pct"] > 0
@@ -383,7 +384,7 @@ def test_simulate_trade_bid_side_fees_partials_and_stop_not_at_level(synth):
     cfg = EWConfig()
     t0 = int(k["ts"][starts[0]])
     tA = simulate_trade(k, tr, "POND/USD", t0, "A", "partial", cfg)
-    assert tA is not None and tA.fills[0].side == "buy" and tA.fills[0].price > float(k["open"][starts[0] + 1])  # paid the ask plus slippage
+    assert tA is not None and tA.fills[0].side == "buy" and tA.fills[0].price > float(k["open"][starts[0]])  # paid the ask plus slippage at the first executable candle
     assert len(tA.fills) >= 2 and tA.fees > 0 and tA.pnl_pct > 0 and tA.mfe_pct > 5
     assert any("partial" in f.reason for f in tA.fills)
     tB = simulate_trade(k, tr, "POND/USD", t0, "B", "fixed", cfg)
@@ -412,10 +413,11 @@ def test_backtest_methods_out_of_sample(synth):
     store.upsert_aggtrades("POND/USD", rows)
     ev = detect_events(k, cfg.surge, tr)
     store.replace_events("POND/USD", ev)
+    cfg.targets.setup_eas = 0  # exercise the pipeline independently of signal quality
     study.build_windows(store, "POND/USD", k, tr, ev, cfg, grid_step_min=60)
     study.score_windows(store, "POND/USD", cfg)
     bt = backtest.run_methods(store, ["POND/USD"], cfg)
-    assert bt["n_setups"] > 0 and bt["n_train"] + bt["n_test"] == bt["n_setups"]
+    assert bt["n_setups"] > 0 and bt["n_train"] + bt["n_test"] + bt["n_embargoed"] == bt["n_setups"]
     assert "A/partial" in bt["results"] and "test" in bt["results"]["A/partial"] and "train" in bt["results"]["A/partial"]
 
 
@@ -526,7 +528,7 @@ def test_engine_paper_book_trades_only_with_validated_target_and_respects_limits
     k, _starts = synthetic_klines(days=9, seed=6, surges=1)
     store = EWStore(":memory:")
     # a validated, tradeable 60-minute target from "research"
-    store.put_study("targets", {"n_setups": 100, "horizons": {"60": {"reliable": True, "tradeable": True, "target_net_pct": 2.5, "target_gross_pct": 3.0, "probability_validated": False, "label": "target +2.50% net"}}})
+    store.put_study("targets", {"policy_version": "causal-v2", "n_setups": 100, "horizons": {"60": {"reliable": True, "tradeable": True, "target_net_pct": 2.5, "target_gross_pct": 3.0, "probability_validated": False, "label": "target +2.50% net"}}})
     eng, events, store, clock, tickers, elig = make_engine(k, store=store)
     eng.scan(tickers, elig)
     eng.ensure_history("POND/USD")
@@ -589,6 +591,7 @@ def test_engine_run_loop_with_fake_feed():
 def test_research_demo_end_to_end_and_report(tmp_path):
     store = EWStore(tmp_path / "ew.db")
     cfg = EWConfig(days=20)
+    cfg.targets.setup_eas = 0
     cfg.seed_symbols = ["POND/USD", "COMP/USD"]
     lines = []
     summary = research(store, cfg, demo=True, progress=lines.append)
@@ -598,3 +601,4 @@ def test_research_demo_end_to_end_and_report(tmp_path):
     assert "SYNTHETIC DATA" in text and "## 2. Surge events" in text and "False-positive" in text or "false-positive rate" in text
     assert "TARGET NOT YET RELIABLE" in text or "net" in text
     assert "## 9-10" in text and "A/partial" in text
+

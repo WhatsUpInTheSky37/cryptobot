@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import math
 import uuid
+from decimal import Decimal, ROUND_FLOOR
 from dataclasses import dataclass
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from cryptobot.strategy.config import RiskRules
 
@@ -18,10 +19,13 @@ from cryptobot.strategy.config import RiskRules
 class RiskLimits(BaseModel):
     """User-facing spending limits (Risk & Budget screen)."""
 
-    budget: float = 100.0  # hard cap on money at risk, fees included
-    per_position_pct: float = 25.0  # max % of budget in any single coin (exchange minimums make 10% unusable at $100)
-    daily_loss_pct: float = 5.0  # stop for the day when today's loss reaches this % of budget
-    max_drawdown_pct: float = 20.0  # stop entirely when equity falls this % from its peak
+    model_config = ConfigDict(allow_inf_nan=False)
+    budget: float = Field(default=100.0, gt=0)
+    per_position_pct: float = Field(default=25.0, gt=0, le=100)
+    daily_loss_pct: float = Field(default=5.0, gt=0, le=100)
+    max_drawdown_pct: float = Field(default=20.0, gt=0, le=100)
+    risk_per_trade_pct: float = Field(default=1.0, gt=0, le=100)
+    max_open_risk_pct: float = Field(default=3.0, gt=0, le=100)
     timezone: str = "America/New_York"  # the "day" for the daily limit
 
 
@@ -75,12 +79,13 @@ class RiskContext:
     halted: bool
     info: MarketInfo
     now_ms: int
+    open_risk: float = 0.0
 
 
 def floor_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
-    return math.floor(x / step + 1e-9) * step
+    return float((Decimal(str(x)) / Decimal(str(step))).to_integral_value(rounding=ROUND_FLOOR) * Decimal(str(step)))
 
 
 class RiskManager:
@@ -93,6 +98,18 @@ class RiskManager:
         self.rejected = 0
 
     def approve(self, intent: OrderIntent, ctx: RiskContext) -> Approval | Rejection:
+        self._issued = {k: a for k, a in self._issued.items() if 0 <= ctx.now_ms - a.issued_ms <= 30_000}
+        values = (intent.amount, intent.price, ctx.cash, ctx.in_use_total, ctx.position_basis,
+                  ctx.position_units, ctx.open_risk, self.slippage_pct,
+                  ctx.info.taker_fee, ctx.info.amount_step, ctx.info.min_amount, ctx.info.min_cost)
+        if not all(math.isfinite(v) for v in values) or intent.amount <= 0 or intent.price <= 0:
+            return self._reject(intent, "amount, price, balances and market filters must be finite and valid")
+        if min(ctx.info.taker_fee, ctx.info.amount_step, ctx.info.min_amount, ctx.info.min_cost) < 0:
+            return self._reject(intent, "negative market filter or fee")
+        if ctx.open_risk < 0 or self.slippage_pct < 0:
+            return self._reject(intent, "negative open risk or slippage")
+        if intent.stop_price is not None and (not math.isfinite(intent.stop_price) or intent.stop_price <= 0):
+            return self._reject(intent, "invalid stop-loss")
         if intent.side == "sell":
             return self._approve_sell(intent, ctx)
         if intent.side != "buy":
@@ -114,6 +131,24 @@ class RiskManager:
             "per-position limit": self.limits.budget * self.limits.per_position_pct / 100.0 - ctx.position_basis,
             "cash": ctx.cash,
         }
+        if intent.stop_price is not None:
+            loss_per_unit = eff_price * (1 + fee) - intent.stop_price * (1 - self.slippage_pct / 100) * (1 - fee)
+            pending_risk = sum(
+                a.amount * max(0, a.intent.price * (1 + self.slippage_pct / 100) * (1 + a.fee_rate)
+                               - a.intent.stop_price * (1 - self.slippage_pct / 100) * (1 - a.fee_rate))
+                for a in self._issued.values() if a.intent.side == "buy" and a.intent.stop_price is not None
+            )
+            risk_left = min(self.limits.budget * self.limits.risk_per_trade_pct / 100,
+                            self.limits.budget * self.limits.max_open_risk_pct / 100 - ctx.open_risk - pending_risk)
+            if loss_per_unit > 0:
+                caps["loss-at-stop limit"] = max(0, risk_left) / loss_per_unit * eff_price * (1 + fee)
+        for a in self._issued.values():
+            if a.intent.side == "buy":
+                reserve = a.notional * (1 + self.slippage_pct / 100) * (1 + a.fee_rate)
+                caps["cash"] -= reserve
+                caps["budget"] -= reserve
+                if a.intent.symbol == intent.symbol:
+                    caps["per-position limit"] -= reserve
         allowed = min(requested, *caps.values())
         if allowed <= 1e-9:
             tight = min(caps, key=caps.get)  # type: ignore[arg-type]
@@ -129,14 +164,15 @@ class RiskManager:
         return self._issue(intent, amount, fee, ctx.now_ms)
 
     def _approve_sell(self, intent: OrderIntent, ctx: RiskContext) -> Approval | Rejection:
+        reserved = sum(a.amount for a in self._issued.values() if a.intent.side == "sell" and a.intent.symbol == intent.symbol)
+        available = max(0.0, ctx.position_units - reserved)
         if ctx.position_units <= 0:
             return self._reject(intent, "nothing to sell")
-        if intent.amount >= ctx.position_units * (1 - 1e-9):
-            amount = ctx.position_units  # closing: sell everything, dust included
-        else:
-            amount = floor_to_step(min(intent.amount, ctx.position_units), ctx.info.amount_step)
+        amount = floor_to_step(min(intent.amount, available), ctx.info.amount_step)
         if amount <= 0:
             return self._reject(intent, "sell amount rounds to zero")
+        if amount < ctx.info.min_amount or amount * intent.price < ctx.info.min_cost:
+            return self._reject(intent, "remaining position is below the exchange minimum; manual dust conversion may be required")
         return self._issue(intent, amount, ctx.info.taker_fee, ctx.now_ms)
 
     def _issue(self, intent: OrderIntent, amount: float, fee: float, now_ms: int) -> Approval:
@@ -149,9 +185,13 @@ class RiskManager:
         self.rejected += 1
         return Rejection(intent, reason)
 
-    def consume(self, token: str) -> Approval:
+    def consume(self, token: str, now_ms: int | None = None) -> Approval:
         """Executors call this; a token works exactly once."""
         try:
-            return self._issued.pop(token)
+            approval = self._issued.pop(token)
+            if now_ms is not None and not 0 <= now_ms - approval.issued_ms <= 30_000:
+                raise PermissionError("risk approval expired")
+            return approval
         except KeyError:
             raise PermissionError("order has no valid risk approval") from None
+

@@ -62,7 +62,10 @@ class _BacktestWorker(QThread):
             if len(bars) < 60:
                 raise ValueError(f"Only {len(bars)} bars available; need at least 60.")
             self.progress.emit(f"Backtesting on {len(bars)} bars…")
-            rep = run_backtest(BarArrays.from_bars(bars), config, budget, costs)
+            from cryptobot.engine.risk import RiskLimits
+            raw_limits = store.get_setting("risk.limits")
+            limits = RiskLimits.model_validate(raw_limits).model_copy(update={"budget": budget}) if raw_limits else RiskLimits(budget=budget)
+            rep = run_backtest(BarArrays.from_bars(bars), config, budget, costs, limits=limits)
             if note:
                 from cryptobot.backtest.report import Warning_
 
@@ -513,3 +516,4 @@ def _fmt(v: float, fmt: str) -> str:
     if v == float("inf"):
         return "∞"
     return f"{v:.2f}"
+

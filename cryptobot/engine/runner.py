@@ -20,6 +20,7 @@ from cryptobot.data.feed import MarketFeed
 from cryptobot.db.store import Store
 from cryptobot.engine.risk import RiskLimits
 from cryptobot.engine.trader import Trader
+from cryptobot.engine.worker import TraderWorker
 from cryptobot.earlywarning.config import EWConfig
 from cryptobot.earlywarning.data import BinanceUSData, make_client
 from cryptobot.earlywarning.engine import EarlyWarningEngine
@@ -149,130 +150,145 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
                 continue
             kind = cmd.get("type")
             trader: Trader | None = holder["trader"]
-            if kind == "stop":
-                break
-            if kind == "set_market":
-                market["exchange"], market["symbols"] = cmd["exchange"], list(cmd["symbols"])
-                await restart_feed()
-                log.info("market changed: %s %s", market["exchange"], ", ".join(market["symbols"]))
-            elif kind == "start_trading":
-                if trader is not None:
-                    trader.stop("restarting")
-                    holder["trader"] = None
-                strategy = StrategyConfig.model_validate(cmd["strategy"])
-                limits = RiskLimits.model_validate(cmd["limits"])
-                mode = Mode(cmd.get("mode", "TEST"))
-                market["exchange"], market["symbols"], market["tf"] = cmd["exchange"], list(cmd["symbols"]), strategy.timeframe_s
-                exchange_obj = None
-                creds = cmd.pop("credentials", None)  # never logged, never persisted
-                if mode == Mode.BUY and creds:
-                    from cryptobot.data.account import make_exchange
+            try:
+                if kind == "stop":
+                    break
+                if kind == "set_market":
+                    if (trader is not None and trader.has_exposure) or holder["pulse"] is not None:
+                        evt_q.put(AlertEvent("warn", "Active market is pinned", "Liquidate held assets and stop Pulse before changing the shared market. Existing assets remain subscribed.", int(time.time() * 1000)))
+                        continue
+                    if trader is not None:
+                        await trader.close()
+                        holder["trader"] = None
+                    market["exchange"], market["symbols"] = cmd["exchange"], list(cmd["symbols"])
+                    await restart_feed()
+                    log.info("market changed: %s %s", market["exchange"], ", ".join(market["symbols"]))
+                elif kind == "start_trading":
+                    if trader is not None:
+                        if trader.has_exposure:
+                            if cmd.get("mode", "TEST") == trader.trader.mode.value and cmd["exchange"] == trader.trader.exchange_id:
+                                trader.resume()
+                            else:
+                                trader.stop("Entry decisions paused: close the current book before changing mode or venue")
+                            evt_q.put(AlertEvent("warn", "Existing positions retained", "The current trading book remains supervised. Liquidate before changing its strategy or account.", int(time.time() * 1000)))
+                            continue
+                        await trader.close()
+                        holder["trader"] = None
+                    strategy = StrategyConfig.model_validate(cmd["strategy"])
+                    limits = RiskLimits.model_validate(cmd["limits"])
+                    mode = Mode(cmd.get("mode", "TEST"))
+                    market["exchange"], market["symbols"], market["tf"] = cmd["exchange"], list(cmd["symbols"]), strategy.timeframe_s
+                    exchange_obj = None
+                    creds = cmd.pop("credentials", None)  # never logged, never persisted
+                    if mode == Mode.BUY and creds:
+                        from cryptobot.data.account import make_exchange
 
-                    exchange_obj = make_exchange(market["exchange"], creds["key"], creds["secret"], creds.get("passphrase"))
-                    exchange_obj.load_markets()
-                try:
-                    t = Trader(store, evt_q.put, market["exchange"], market["symbols"], strategy, limits, mode=mode,
-                               slippage_pct=float(cmd.get("slippage_pct", 0.05)), reset_peak=bool(cmd.get("reset_peak", False)),
-                               exchange=exchange_obj)
-                except (NotImplementedError, ValueError) as e:
-                    log.error("cannot start: %s", e)
-                    evt_q.put(LogEvent("ERROR", "trader", f"Cannot start {mode.value} mode: {e}", int(time.time() * 1000)))
-                    evt_q.put(AlertEvent("bad", f"Cannot start {mode.value} mode", str(e), int(time.time() * 1000)))
-                    continue
-                t.start()
-                holder["trader"] = t
-                await restart_feed()  # re-sends history so the trader can decide immediately
-            elif kind == "stop_trading":
-                if trader is not None:
-                    trader.stop()
-                    holder["trader"] = None
-            elif kind == "emergency_stop":
-                if trader is not None:
-                    trader.emergency_stop()
-                    holder["trader"] = None
-            elif kind == "resume":
-                if trader is not None and not trader.resume():
-                    evt_q.put(LogEvent("WARNING", "trader", "Cannot resume yet: the daily limit resets at local midnight.", int(time.time() * 1000)))
-            elif kind == "pulse_start":
-                if holder["pulse"] is not None:
-                    holder["pulse"].stop()
-                    holder["pulse"] = None
-                await stop_pulse_feed()
-                pcfg = PulseConfig.model_validate(cmd.get("config") or {})
-                p_ex = cmd.get("exchange") or market["exchange"]
-                p_syms = list(cmd.get("symbols") or market["symbols"])
-                plan, feed_syms = plan_pulse_feed(p_ex, p_syms, market["exchange"], list(market["symbols"]))
-                pu = PulseEngine(store, evt_q.put, p_ex, p_syms, pcfg, slippage_pct=float(cmd.get("slippage_pct", 0.05)))
-                if plan != "shared":
-                    # Pulse is paper-only and needs no key: it may watch a liquid exchange while the trader stays on another.
-                    # Its feed's events go to the Pulse engine only, never to the Market page or the trader. On the same
-                    # exchange it subscribes only to the coins the main feed lacks: a second connection with the same
-                    # subscriptions is what trips Coinbase's rate limit.
-                    extra_only = plan == "extra"
+                        exchange_obj = make_exchange(market["exchange"], creds["key"], creds["secret"], creds.get("passphrase"))
+                        await asyncio.to_thread(exchange_obj.load_markets)
+                    try:
+                        t = await TraderWorker(lambda: Trader(store, evt_q.put, market["exchange"], market["symbols"], strategy, limits, mode=mode,
+                                   slippage_pct=float(cmd.get("slippage_pct", 0.05)), reset_peak=bool(cmd.get("reset_peak", False)),
+                                   exchange=exchange_obj)).wait_ready()
+                    except Exception as e:
+                        log.error("cannot start: %s", e)
+                        evt_q.put(LogEvent("ERROR", "trader", f"Cannot start {mode.value} mode: {e}", int(time.time() * 1000)))
+                        evt_q.put(AlertEvent("bad", f"Cannot start {mode.value} mode", str(e), int(time.time() * 1000)))
+                        continue
+                    holder["trader"] = t
+                    market["symbols"] = t.symbols
+                    await restart_feed()  # re-sends history so the trader can decide immediately
+                elif kind == "stop_trading":
+                    if trader is not None:
+                        trader.stop()  # pause entries, retain protection and the event subscription
+                elif kind == "emergency_stop":
+                    if trader is not None:
+                        trader.emergency_stop()  # retain the worker until liquidation is confirmed
+                elif kind == "resume":
+                    if trader is not None:
+                        trader.resume()
+                elif kind == "pulse_start":
+                    if holder["pulse"] is not None:
+                        await holder["pulse"].close()
+                        holder["pulse"] = None
+                    await stop_pulse_feed()
+                    pcfg = PulseConfig.model_validate(cmd.get("config") or {})
+                    p_ex = cmd.get("exchange") or market["exchange"]
+                    p_syms = list(cmd.get("symbols") or market["symbols"])
+                    pu = await TraderWorker(lambda: PulseEngine(store, evt_q.put, p_ex, p_syms, pcfg, slippage_pct=float(cmd.get("slippage_pct", 0.05)))).wait_ready()
+                    p_syms = pu.symbols
+                    plan, feed_syms = plan_pulse_feed(p_ex, p_syms, market["exchange"], list(market["symbols"]))
+                    if plan != "shared":
+                        # Pulse is paper-only and needs no key: it may watch a liquid exchange while the trader stays on another.
+                        # Its feed's events go to the Pulse engine only, never to the Market page or the trader. On the same
+                        # exchange it subscribes only to the coins the main feed lacks: a second connection with the same
+                        # subscriptions is what trips Coinbase's rate limit.
+                        extra_only = plan == "extra"
 
-                    def pulse_emit(ev: Event, _pu=pu, _extra=extra_only) -> None:
-                        if _extra and isinstance(ev, (ConnectionEvent, HeartbeatEvent)):
-                            return  # the main feed's connection and clock drive Pulse; this feed only adds coins
+                        def pulse_emit(ev: Event, _pu=pu, _extra=extra_only) -> None:
+                            if _extra and isinstance(ev, (ConnectionEvent, HeartbeatEvent)):
+                                return  # the main feed's connection and clock drive Pulse; this feed only adds coins
+                            try:
+                                _pu.on_event(ev)
+                            except Exception:  # noqa: BLE001
+                                log.exception("pulse failed on %s", type(ev).__name__)
+
+                        pfeed = MarketFeed(p_ex, feed_syms, pulse_emit, timeframes_s=(1, 60), history_bars=120)
+                        holder["pulse_feed_stop"] = asyncio.Event()
+                        holder["pulse_feed_task"] = asyncio.create_task(pfeed.run(holder["pulse_feed_stop"]), name="pulse-feed")
+                        pu.own_feed = not extra_only
+                    if plan != "own" and holder["conn"] is not None:
+                        pu.on_event(holder["conn"])  # the main feed may already be connected; Pulse must not wait for an event that never comes
+                    holder["pulse"] = pu
+                    log.info("pulse started on %s %s (%s)", p_ex, ", ".join(p_syms),
+                             {"shared": "sharing the Market feed", "extra": "Market feed plus its own for " + ", ".join(feed_syms), "own": "own feed"}[plan])
+                elif kind == "pulse_stop":
+                    if holder["pulse"] is not None:
+                        await holder["pulse"].close()
+                        holder["pulse"] = None
+                    await stop_pulse_feed()
+                elif kind == "ew_start":
+                    if holder["ew"] is not None:
+                        holder["ew_stop"].set()
                         try:
-                            _pu.on_event(ev)
-                        except Exception:  # noqa: BLE001
-                            log.exception("pulse failed on %s", type(ev).__name__)
+                            await asyncio.wait_for(holder["ew_task"], timeout=15)
+                        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                            holder["ew_task"].cancel()
+                    ew_store = EWStore(Path(config["db_path"]).with_name("earlywarning.db"))
+                    ew_cfg = EWConfig.model_validate(cmd.get("config") or {})
+                    ew_store.set("config", ew_cfg.model_dump())
+                    ex_id = cmd.get("exchange", "binanceus")
+                    ew = EarlyWarningEngine(ew_store, evt_q.put, ex_id, ew_cfg, data=BinanceUSData(make_client(ex_id), ew_store))
+                    holder["ew"], holder["ew_stop"] = ew, asyncio.Event()
+                    holder["ew_task"] = asyncio.create_task(ew.run(holder["ew_stop"]), name="earlywarning")
+                    log.info("early warning started on %s", ex_id)
+                elif kind == "ew_stop":
+                    if holder["ew"] is not None:
+                        holder["ew_stop"].set()
+                        try:
+                            await asyncio.wait_for(holder["ew_task"], timeout=15)
+                        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                            holder["ew_task"].cancel()
+                        holder["ew"] = None
+                elif kind == "pulse_train":
+                    if holder["pulse"] is not None:
+                        holder["pulse"].submit("train_now")
+                    else:
+                        evt_q.put(LogEvent("WARNING", "pulse", "Start Pulse before training the model.", int(time.time() * 1000)))
+                elif kind == "set_limits":
+                    if trader is not None:
+                        trader.set_limits(RiskLimits.model_validate(cmd["limits"]))
+                elif kind == "ping":
+                    evt_q.put(LogEvent("DEBUG", "engine", "pong", int(time.time() * 1000)))
+            except Exception as error:
+                log.exception("engine command rejected: %s", kind)
+                evt_q.put(AlertEvent("bad", "Command rejected", f"{kind}: {error}", int(time.time() * 1000)))
 
-                    pfeed = MarketFeed(p_ex, feed_syms, pulse_emit, timeframes_s=(1, 60), history_bars=120)
-                    holder["pulse_feed_stop"] = asyncio.Event()
-                    holder["pulse_feed_task"] = asyncio.create_task(pfeed.run(holder["pulse_feed_stop"]), name="pulse-feed")
-                    pu.own_feed = not extra_only
-                if plan != "own" and holder["conn"] is not None:
-                    pu.on_event(holder["conn"])  # the main feed may already be connected; Pulse must not wait for an event that never comes
-                pu.start()
-                holder["pulse"] = pu
-                log.info("pulse started on %s %s (%s)", p_ex, ", ".join(p_syms),
-                         {"shared": "sharing the Market feed", "extra": "Market feed plus its own for " + ", ".join(feed_syms), "own": "own feed"}[plan])
-            elif kind == "pulse_stop":
-                if holder["pulse"] is not None:
-                    holder["pulse"].stop()
-                    holder["pulse"] = None
-                await stop_pulse_feed()
-            elif kind == "ew_start":
-                if holder["ew"] is not None:
-                    holder["ew_stop"].set()
-                    try:
-                        await asyncio.wait_for(holder["ew_task"], timeout=15)
-                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-                        holder["ew_task"].cancel()
-                ew_store = EWStore(Path(config["db_path"]).with_name("earlywarning.db"))
-                ew_cfg = EWConfig.model_validate(cmd.get("config") or {})
-                ew_store.set("config", ew_cfg.model_dump())
-                ex_id = cmd.get("exchange", "binanceus")
-                ew = EarlyWarningEngine(ew_store, evt_q.put, ex_id, ew_cfg, data=BinanceUSData(make_client(ex_id), ew_store))
-                holder["ew"], holder["ew_stop"] = ew, asyncio.Event()
-                holder["ew_task"] = asyncio.create_task(ew.run(holder["ew_stop"]), name="earlywarning")
-                log.info("early warning started on %s", ex_id)
-            elif kind == "ew_stop":
-                if holder["ew"] is not None:
-                    holder["ew_stop"].set()
-                    try:
-                        await asyncio.wait_for(holder["ew_task"], timeout=15)
-                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-                        holder["ew_task"].cancel()
-                    holder["ew"] = None
-            elif kind == "pulse_train":
-                if holder["pulse"] is not None:
-                    note = holder["pulse"].train_now()
-                    evt_q.put(LogEvent("INFO", "pulse", f"ML: {note}", int(time.time() * 1000)))
-                else:
-                    evt_q.put(LogEvent("WARNING", "pulse", "Start Pulse before training the model.", int(time.time() * 1000)))
-            elif kind == "set_limits":
-                if trader is not None:
-                    trader.set_limits(RiskLimits.model_validate(cmd["limits"]))
-            elif kind == "ping":
-                evt_q.put(LogEvent("DEBUG", "engine", "pong", int(time.time() * 1000)))
     finally:
         trader = holder["trader"]
         if trader is not None:
-            trader.stop("engine shutting down")
+            await trader.close()
         if holder["pulse"] is not None:
-            holder["pulse"].stop()
+            await holder["pulse"].close()
         await stop_pulse_feed()
         if holder["ew"] is not None:
             holder["ew_stop"].set()
@@ -291,3 +307,4 @@ async def _run(cmd_q, evt_q, config: dict[str, Any]) -> None:
 
 def _get_cmd(cmd_q) -> dict[str, Any]:
     return cmd_q.get(timeout=0.5)
+

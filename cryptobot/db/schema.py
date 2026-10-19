@@ -48,6 +48,12 @@ class TradeRow(Base):
     order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="filled")
+    position_closed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    fees_json: Mapped[str] = mapped_column(Text, default="[]")
+    fee_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    base_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    quote_fee: Mapped[float | None] = mapped_column(Float, nullable=True)
+    external_fee_value: Mapped[float] = mapped_column(Float, default=0.0)
 
 
 class PositionRow(Base):
@@ -96,6 +102,26 @@ class AuditLog(Base):
     category: Mapped[str] = mapped_column(String(32))
     message: Mapped[str] = mapped_column(Text)
     data_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class OrderJournal(Base):
+    """Durable intent and exchange response; unknown orders continue reserving funds."""
+    __tablename__ = "order_journal"
+    client_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(128), index=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    request_json: Mapped[str] = mapped_column(Text)
+    response_json: Mapped[str] = mapped_column(Text, default="{}")
+    fill_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_ms: Mapped[int] = mapped_column(Integer)
+
+
+class AppliedExecution(Base):
+    __tablename__ = "applied_executions"
+    execution_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(Integer)
 
 
 class PulseEventRow(Base):
@@ -165,11 +191,17 @@ class PulseEventRow(Base):
     ret_5m: Mapped[float | None] = mapped_column(Float, nullable=True)
     ret_10m: Mapped[float | None] = mapped_column(Float, nullable=True)
     ret_20m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    horizon_ms: Mapped[int] = mapped_column(Integer, default=1_200_000)
+    policy_version: Mapped[str] = mapped_column(String(32), default="legacy")
+    label_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_observed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_move: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 OUTCOME_COLUMNS = frozenset({
     "outcome", "mfe_pct", "mae_pct", "resolved_ts_ms", "trade_pnl", "first_hit", "first_hit_ms", "time_to_mfe_ms", "time_to_mae_ms",
     "net_pct", "ret_30s", "ret_1m", "ret_2m", "ret_5m", "ret_10m", "ret_20m",
+    "last_observed_ms", "last_move",
 })
 
 
@@ -190,3 +222,4 @@ class PulseDecisionRow(Base):
 
 
 Index("ix_trades_mode_ts", TradeRow.mode, TradeRow.ts_ms)
+

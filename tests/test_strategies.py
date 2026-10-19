@@ -123,13 +123,13 @@ def test_ema_cross_logic_and_regime_gate():
 
 def test_vol_target_never_scales_up_and_blend_averages():
     b = synthetic(300, seed=2)
-    base = StrategyConfig(strategies=[StrategySpec(id="dca")], regime_gate=False, vol_target=False)
-    vt = StrategyConfig(strategies=[StrategySpec(id="dca")], regime_gate=False, vol_target=True, target_annual_vol=0.10)
+    base = StrategyConfig(strategies=[StrategySpec(id="macd")], regime_gate=False, vol_target=False)
+    vt = StrategyConfig(strategies=[StrategySpec(id="macd")], regime_gate=False, vol_target=True, target_annual_vol=0.10)
     e0, _ = compute_target_exposure(base, b)
     e1, w1 = compute_target_exposure(vt, b)
     assert np.all(e1[w1:] <= e0[w1:] + 1e-12)
     assert np.any(e1[w1:] < e0[w1:])
-    blend = StrategyConfig(strategies=[StrategySpec(id="dca"), StrategySpec(id="ema_cross")], regime_gate=False, vol_target=False)
+    blend = StrategyConfig(strategies=[StrategySpec(id="macd"), StrategySpec(id="ema_cross")], regime_gate=False, vol_target=False)
     eb, wb = compute_target_exposure(blend, b)
     ee, _ = compute_target_exposure(StrategyConfig(strategies=[StrategySpec(id="ema_cross")], regime_gate=False, vol_target=False), b)
     np.testing.assert_allclose(eb[wb:], (e0[wb:] + ee[wb:]) / 2)
@@ -156,3 +156,4 @@ def test_grid_floor_stop_and_ladder_direction():
     hi, lo = ratio[ok] > 1.08, ratio[ok] < 0.92
     assert e[ok][hi].mean() < e[ok][lo].mean()
     assert np.all(e[ok][b.close[ok] < anchor[ok] * 0.9 * 0.9] == 0)  # below the floor: out
+

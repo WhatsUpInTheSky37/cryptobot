@@ -53,7 +53,7 @@ EXCHANGES: dict[str, dict] = {
     },
     "binanceus": {
         "name": "Binance.US",
-        "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BTC/USD"],
+        "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
         "available_us": True,
     },
     "binance": {
@@ -69,3 +69,4 @@ DEFAULT_EXCHANGE = "kraken"
 # 1s is built from the trade stream; the others are also backfilled from REST.
 LIVE_TIMEFRAMES_S: tuple[int, ...] = (1, 60, 300)
 HISTORY_BARS = 300
+

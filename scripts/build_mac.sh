@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 if [ ! -x .venv/bin/python ]; then
   uv venv --python 3.12 .venv
 fi
-uv pip install -q -p .venv/bin/python -e ".[dev,build]"
+uv sync --frozen --extra dev --extra build --python 3.12
 .venv/bin/python packaging/make_icons.py
 rm -rf build dist/CryptoBot dist/CryptoBot.app dist/CryptoBot.dmg
 .venv/bin/pyinstaller --noconfirm --clean packaging/cryptobot.spec
@@ -14,3 +14,4 @@ rm -rf build dist/CryptoBot dist/CryptoBot.app dist/CryptoBot.dmg
 codesign --force --deep --sign "${CODESIGN_IDENTITY:--}" dist/CryptoBot.app
 hdiutil create -volname CryptoBot -srcfolder dist/CryptoBot.app -ov -format UDZO dist/CryptoBot.dmg >/dev/null
 echo "Built dist/CryptoBot.app and dist/CryptoBot.dmg"
+

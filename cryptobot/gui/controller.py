@@ -4,8 +4,9 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import queue
+import threading
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, Signal, Slot, QTimer
 
 from cryptobot.config import AppPaths
 from cryptobot.core.events import (
@@ -33,26 +34,38 @@ from cryptobot.strategy.config import StrategyConfig
 log = logging.getLogger(__name__)
 
 
-class _Bridge(QThread):
-    event = Signal(object)
+class _Bridge(QObject):
+    event = Signal(object, object)
 
     def __init__(self, q) -> None:
         super().__init__()
         self._q = q
-        self._running = True
+        self._stopped = threading.Event()
+        # A process dying mid-frame can strand a multiprocessing.Queue reader.
+        # A daemon Python thread can be detached safely; destroying a live
+        # QThread would abort the desktop application during recovery.
+        self._thread = threading.Thread(target=self.run, name="engine-events", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def wait(self, timeout_ms: int) -> bool:
+        self._thread.join(timeout_ms / 1000)
+        return not self._thread.is_alive()
 
     def run(self) -> None:
-        while self._running:
+        while not self._stopped.is_set():
             try:
                 ev = self._q.get(timeout=0.2)
             except queue.Empty:
                 continue
             except (EOFError, OSError):
                 break
-            self.event.emit(ev)
+            if not self._stopped.is_set():
+                self.event.emit(self, ev)
 
     def stop(self) -> None:
-        self._running = False
+        self._stopped.set()
 
 
 class EngineController(QObject):
@@ -84,6 +97,30 @@ class EngineController(QObject):
         self._bridge: _Bridge | None = None
         self.exchange: str = ""
         self.symbols: list[str] = []
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(1000)
+        self._watchdog.timeout.connect(self._check_process)
+        self._watchdog.start()
+
+    def _check_process(self):
+        if self._proc is not None and not self._proc.is_alive() and self._proc.exitcode is not None:
+            self._proc.join(timeout=0)
+            self._release_channels()
+            self._proc = None
+            self.engine_state.emit("crashed")
+
+    def _release_channels(self) -> None:
+        bridge, self._bridge = self._bridge, None
+        if bridge is not None:
+            bridge.stop()
+            bridge.event.disconnect(self._dispatch_bridge)
+            if not bridge.wait(1000):
+                log.warning("detached event reader from a dead engine")
+        for channel in (self._cmd_q, self._evt_q):
+            if channel is not None:
+                channel.cancel_join_thread()
+                channel.close()
+        self._cmd_q = self._evt_q = None
 
     @property
     def running(self) -> bool:
@@ -93,6 +130,8 @@ class EngineController(QObject):
         if self.running:
             self.set_market(exchange, symbols)
             return
+        self._check_process()
+        self._release_channels()
         self.exchange, self.symbols = exchange, list(symbols)
         self._cmd_q = self._ctx.Queue()
         self._evt_q = self._ctx.Queue()
@@ -105,7 +144,7 @@ class EngineController(QObject):
         self._proc = self._ctx.Process(target=engine_main, args=(self._cmd_q, self._evt_q, config), daemon=True, name="cryptobot-engine")
         self._proc.start()
         self._bridge = _Bridge(self._evt_q)
-        self._bridge.event.connect(self._dispatch)
+        self._bridge.event.connect(self._dispatch_bridge)
         self._bridge.start()
         self.engine_state.emit("running")
         log.info("engine process started pid=%s", self._proc.pid)
@@ -173,10 +212,14 @@ class EngineController(QObject):
                 log.warning("engine did not stop in time; terminating")
                 self._proc.terminate()
                 self._proc.join(timeout=2)
-        if self._bridge is not None:
-            self._bridge.wait(1000)
+        self._release_channels()
         self._proc = None
         self.engine_state.emit("stopped")
+
+    @Slot(object, object)
+    def _dispatch_bridge(self, source: _Bridge, ev: object) -> None:
+        if source is self._bridge:
+            self._dispatch(ev)
 
     def _dispatch(self, ev: object) -> None:
         if isinstance(ev, BarsEvent):
@@ -185,8 +228,7 @@ class EngineController(QObject):
             self.tick.emit(ev)
         elif isinstance(ev, HeartbeatEvent):
             self.heartbeat.emit(ev)
-            if self._proc is not None and not self._proc.is_alive():
-                self.engine_state.emit("crashed")
+            self._check_process()
         elif isinstance(ev, ConnectionEvent):
             self.connection.emit(ev)
         elif isinstance(ev, LogEvent):
@@ -213,3 +255,4 @@ class EngineController(QObject):
             self.pulse_event.emit(ev)
         elif isinstance(ev, EWStatusEvent):
             self.ew_status.emit(ev)
+

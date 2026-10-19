@@ -7,7 +7,7 @@ fitted, and it is validated walk-forward before it may influence a mode.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Indicator keys. Long and short sides are ranked separately for the
 # directional ones (f, w, r, c, acc, vpr); a, sx and vx are symmetric.
@@ -93,6 +93,7 @@ class RiskConfig(BaseModel):
 
 
 class PulseConfig(BaseModel):
+    wallet_quote: str = ""
     # observation
     window_s: int = 60
     obs_interval_s: int = 5
@@ -141,6 +142,19 @@ class PulseConfig(BaseModel):
     ml_min_events: int = 300
     ml_retrain_minutes: int = 240
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_risk_fields(cls, values):
+        values = dict(values or {})
+        risk = values.get("risk")
+        if isinstance(risk, RiskConfig):
+            risk = risk.model_dump()
+        if isinstance(risk, dict):
+            for key in ("risk_per_trade_pct", "daily_loss_pct", "max_positions", "max_consecutive_losses", "pause_minutes", "per_position_pct"):
+                if key in risk:
+                    values[key] = risk[key]
+        return values
+
     def model_post_init(self, _ctx) -> None:  # noqa: D401
         # keep the legacy risk fields and the risk section in step
         self.risk = self.risk.model_copy(update={
@@ -149,7 +163,8 @@ class PulseConfig(BaseModel):
             "max_open_risk_pct": max(self.risk.max_open_risk_pct, self.risk_per_trade_pct),  # the aggregate cap can never be below one trade's risk
         })
         for m in self.modes:
-            m.budget = self.budget
+            if "budget" not in m.model_fields_set:
+                m.budget = self.budget
 
     def weights_normalized(self) -> dict[str, float]:
         w = {k: float(self.weights.get(k, 0.0)) for k in INDICATORS}
@@ -164,3 +179,4 @@ def break_even_win_rate(target_pct: float, stop_pct: float, cost_pct: float) -> 
 
 def expected_value_pct(p: float, target_pct: float, stop_pct: float, cost_pct: float) -> float:
     return p * target_pct - (1 - p) * stop_pct - cost_pct
+

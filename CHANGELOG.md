@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 — Trading logic and reliability
+
+- Journal uncertain orders, recover terminal fills exactly once, and commit fill/position/checkpoint accounting atomically.
+- Preserve liquidation intent and residual protection after failed exits; use venue-specific native stop types and scoped one-quote books.
+- Separate trader and Pulse workers from the asynchronous feed; add an independent engine watchdog and desktop ownership lock.
+- Retire crashed-engine readers and stale IPC events before restarting; sync the order journal durably before submitting requests.
+- Account for commission assets, complete-position P&L and daily equity changes; validate risk inputs and add loss-at-stop limits.
+- Persist DCA schedules and bounded indicator checkpoints; repair causal labels, research sampling, entry-candle stops and funded method comparisons.
+- Add failure-injection and batch/checkpoint equivalence regressions, frozen dependencies, and pull-request CI.
+- See `docs/trading-logic-reliability.md` for all 38 review items and the exchange/forward-validation boundaries.
+
 ## 0.5.3 — Pulse: taker-fee override on the settings tab
 
 - "Taker fee" on the Pulse settings tab: 0 keeps the exchange's published lowest-tier fee (Coinbase: 1.2% a side, which makes a 2.48% round trip and blocks every entry); an account on a cheaper tier can enter its own rate, and the cost gate and every paper fill use it.
@@ -97,3 +108,4 @@ Crypto Pulse stays **paper only**. Nothing in this release touches API credentia
 
 ### Phase 10 — tests
 - 34 new tests (order book, health, costs, regime, outcomes, memory, store migration and immutability, paper modes, risk limits, ML validation, GUI rendering). The whole suite: 152 passed, 1 skipped.
+

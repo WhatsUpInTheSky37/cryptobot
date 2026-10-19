@@ -38,10 +38,10 @@ class BacktestReport:
     warnings: list[Warning_] = field(default_factory=list)
 
 
-def run_backtest(bars: BarArrays, config: StrategyConfig, budget: float, costs: Costs, folds: int = 4) -> BacktestReport:
+def run_backtest(bars: BarArrays, config: StrategyConfig, budget: float, costs: Costs, folds: int = 4, limits=None) -> BacktestReport:
     exposure, warm = compute_target_exposure(config, bars)
     start = min(warm, max(0, len(bars) - 2))
-    sim = simulate(bars, exposure, budget, costs, config.effective_risk(), start_index=start)
+    sim = simulate(bars, exposure, budget, costs, config.effective_risk(), start_index=start, limits=limits)
     ppy = bars.periods_per_year
     m = compute_metrics(sim.equity, budget, ppy, sim.trades, sim.units, sim.fees_paid)
     bench_fee = budget * costs.fee / (1 + costs.fee)  # the whole budget is bought once
@@ -50,7 +50,7 @@ def run_backtest(bars: BarArrays, config: StrategyConfig, budget: float, costs: 
     every = max(1, int(round(7 * 86400 / bars.timeframe_s)))
     dc = dca(bars, budget, costs, start, every)
     dcm = compute_metrics(dc, budget, ppy, fees_paid=bench_fee)
-    wf = walk_forward(bars, config, budget, costs, folds=folds)
+    wf = walk_forward(bars, config, budget, costs, folds=folds, limits=limits)
     rep = BacktestReport(config, costs, budget, bars, exposure, start, sim, m, bh, bhm, dc, dcm, wf)
     rep.warnings = verdicts(rep)
     return rep
@@ -119,3 +119,4 @@ def verdicts(r: BacktestReport) -> list[Warning_]:
         if not wf.params_stable:
             out.append(Warning_("warn", "The best parameters changed from period to period. The strategy's edge, if any, is not stable."))
     return out
+
