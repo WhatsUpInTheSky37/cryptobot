@@ -250,6 +250,11 @@ class PaperTrader:
             p, p_src = (est.ci_low if self.cfg.conservative_p and est.ci_low is not None else est.p_target), "memory"
         a = assess(target, stop, costs, p, min_ev_pct=m.min_ev_pct, min_rr=m.min_rr, min_target_cost_mult=self.cfg.min_target_cost_mult,
                    p_stop=est.p_stop if est.sufficient else None, expiry_pct=est.expiry_gross_pct if est.sufficient else None)
+        if a.verdict in ("insufficient_evidence", "ev_below_margin", "rr_below_min") and not m.require_evidence:
+            # the research book: it trades the signal at real costs so the equity curve shows whether the signal pays,
+            # instead of waiting for history to say so. The cost gate still applies: a trade that cannot pay its costs is not research.
+            self.accepted += 1
+            return Decision(True, "ok", f"research book: trading without evidence ({a.reason if a.verdict != 'insufficient_evidence' else est.note}); costs {costs.total_pct:.3f}%", a, est, notional, p_src)
         if a.verdict != "ok":
             d = self._rej(a.verdict, a.reason if a.verdict != "insufficient_evidence" else est.note)
             d.assessment, d.estimate, d.notional, d.p_source = a, est, notional, p_src

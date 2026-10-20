@@ -263,8 +263,11 @@ def test_signal_recorded_with_immutable_signal_time_values_and_all_modes_decide(
     assert row["cost_pct"] == pytest.approx(row["fee_pct"] + row["spread_cost_pct"] + row["slip_pct"])
     assert row["evidence"] == "insufficient" and row["similar_p"] == 0.0
     decs = store.load_decisions(event_id=recs[-1].id)
-    assert {d["mode"] for d in decs} == {"A", "B", "C"} and all(not d["accepted"] for d in decs)
-    assert all(d["code"] in ("insufficient_evidence", "weak_signal", "weak_momentum", "no_confirmation", "rr_below_min", "ev_below_margin") for d in decs)
+    assert {d["mode"] for d in decs} == {"A", "B", "C"}
+    # A and B wait for evidence; C is the research book and takes the signal (or is held back only by its risk limits)
+    assert all(not d["accepted"] for d in decs if d["mode"] != "C")
+    assert all(d["code"] in ("insufficient_evidence", "weak_signal", "weak_momentum", "no_confirmation", "rr_below_min", "ev_below_margin") for d in decs if d["mode"] != "C")
+    assert all(d["code"] in ("ok", "open_risk_limit", "max_positions", "already_in_position", "risk_rejected") for d in decs if d["mode"] == "C")
     # signal-time columns cannot be changed afterwards
     with pytest.raises(ValueError):
         store.update_pulse_event(recs[-1].id, prs=99.0)
@@ -536,16 +539,19 @@ def test_stop_is_kept_outside_the_spread_or_the_trade_is_refused():
     drive_neutral(eng, clock, 90)
     drive_pressure(eng, clock, 60)
     drive_pressure(eng, clock, 15, drift=0.05, k0=60)
-    # Widening the stop changes the predicted event: old 0.2%-stop evidence is refused.
-    assert all(S not in m.positions for m in eng.modes.values())
+    # Widening the stop changes the predicted event: old 0.2%-stop evidence is refused by the evidence-based books.
+    assert all(S not in m.positions for k, m in eng.modes.items() if k != "C")
     assert any(d["code"] == "insufficient_evidence" and d["symbol"] == S for d in store.load_decisions())
+    # the research book trades it anyway, with the stop pushed out to 40 spreads
+    pos = eng.modes["C"].positions[S]
+    assert pos.stop_pct == pytest.approx(40.0 * 0.2 / pos.entry_px * 100, rel=0.2) and pos.stop_pct > 0.2
     # 100 spreads would be 0.67%, beyond the 0.6% maximum stop: no trade, with the reason recorded
     eng, ev, store, clock = make(cfg(stop_spread_mult=100.0))
     seed_memory(eng, n=60, p_hit=0.9)
     drive_neutral(eng, clock, 90)
     drive_pressure(eng, clock, 60)
     drive_pressure(eng, clock, 15, drift=0.05, k0=60)
-    assert all(S not in m.positions for m in eng.modes.values())  # (B's book is 2 wide on 80,000: 100 spreads is only 0.25%, so B may still trade)
+    assert all(S not in m.positions for m in eng.modes.values())  # every book, the research one included (BTC's book is 2 wide on 80,000: 100 spreads is only 0.25%, so BTC may still trade)
     assert "stop_inside_spread" in {d["code"] for d in store.load_decisions()}
 
 
@@ -562,3 +568,31 @@ def test_conservative_probability_uses_the_lower_confidence_bound():
     point_ev = row["similar_p"] * row["target_pct"] - (1 - row["similar_p"]) * row["stop_pct"] - row["cost_pct"]
     assert row["ci_low"] < row["similar_p"] and row["ev_pct"] < point_ev - 1e-9
 
+
+
+def test_experimental_book_trades_without_evidence_but_never_below_costs():
+    # no seeded memory: A and B must wait for evidence, C (the research book) trades the signal at real costs
+    eng, ev, store, clock = make()
+    drive_neutral(eng, clock, 90)
+    drive_pressure(eng, clock, 60)
+    drive_pressure(eng, clock, 15, drift=0.05, k0=60)
+    codes = {(d["mode"], d["code"]) for d in store.load_decisions()}
+    assert any(m == "C" and c == "ok" for m, c in codes) and eng.modes["C"].positions, "C trades without history"
+    assert not eng.modes["A"].positions and not eng.modes["B"].positions
+    assert all(c in ("insufficient_evidence", "no_confirmation", "weak_momentum", "regime_excluded", "weak_signal", "open_risk_limit") for m, c in codes if m in ("A", "B"))
+    taken = [d for d in store.load_decisions(mode="C") if d["accepted"]]
+    assert taken and "research book" in taken[0]["reason"]
+    # the cost gate still binds the research book: a quiet market whose expected move cannot pay the fees is refused
+    eng, ev, store, clock = make(cfg(adaptive=True, min_stop_pct=0.15))
+    for st in eng.sym.values():
+        st.feats.vol_pct = 0.0001
+    drive_neutral(eng, clock, 90)
+    drive_pressure(eng, clock, 60)
+    drive_pressure(eng, clock, 15, drift=0.05, k0=60)
+    assert not eng.modes["C"].positions and ("C", "target_below_costs") in {(d["mode"], d["code"]) for d in store.load_decisions()}
+    # a config saved before this release gets the new behaviour for C only
+    old = PulseConfig().model_dump()
+    for m in old["modes"]:
+        m.pop("require_evidence", None)
+    up = PulseConfig.model_validate(old)
+    assert [m.require_evidence for m in up.modes] == [True, True, False]

@@ -66,6 +66,7 @@ class ModeConfig(BaseModel):
     min_rr: float = 1.0  # reward-to-risk after costs
     min_similar: int = 30  # independent similar past events required
     use_ml: bool = False
+    require_evidence: bool = True  # False: a research book that trades every signal above its thresholds at real costs, with no history or expected-value gate
     max_spread_pct: float = 0.10
     max_vol_pct: float = 1.5  # 1-minute range above this is "excessive volatility"
     allowed_regimes: list[str] = Field(default_factory=lambda: ["trend_up", "range", "quiet", "high_vol", "trend_down", "unknown"])
@@ -78,7 +79,7 @@ def default_modes() -> list[ModeConfig]:
         ModeConfig(key="B", label="Balanced", enter_prs=75, min_acc=70, require_breakout=False, min_ev_pct=0.02, min_rr=1.0, min_similar=30,
                    max_spread_pct=0.10, max_vol_pct=1.5),
         ModeConfig(key="C", label="Experimental", enter_prs=65, min_acc=0, require_breakout=False, min_ev_pct=0.0, min_rr=0.8, min_similar=15, use_ml=True,
-                   max_spread_pct=0.12, max_vol_pct=2.0),
+                   require_evidence=False, max_spread_pct=0.12, max_vol_pct=2.0),
     ]
 
 
@@ -165,6 +166,8 @@ class PulseConfig(BaseModel):
         for m in self.modes:
             if "budget" not in m.model_fields_set:
                 m.budget = self.budget
+            if m.key == "C" and "require_evidence" not in m.model_fields_set:
+                m.require_evidence = False  # configs saved before 0.6.1: Experimental becomes the evidence-free research book
 
     def weights_normalized(self) -> dict[str, float]:
         w = {k: float(self.weights.get(k, 0.0)) for k in INDICATORS}

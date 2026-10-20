@@ -403,7 +403,7 @@ class PulsePage(QWidget):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 6, 0, 0)
         top = QHBoxLayout()
-        top.addWidget(QLabel("All three modes see the same signals and pay the same fees, spread and slippage. Nothing here picks a winner: compare, then decide."))
+        top.addWidget(QLabel("All three modes see the same signals and pay the same fees, spread and slippage. A and B trade only with historical evidence; C is the research book and trades every signal above its thresholds, so its curve shows whether the signals pay. Nothing here picks a winner: compare, then decide."))
         top.addStretch(1)
         b = QPushButton("Refresh")
         b.clicked.connect(self.refresh_analysis)

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1 — Pulse: Mode C is the research book
+
+- Mode C (Experimental) now trades every signal above its thresholds without waiting for historical evidence or a positive expected value, at real costs and with the same stops and risk limits, so its paper equity curve shows from day one whether the signals pay. A and B are unchanged and still require evidence. The cost gate is never bypassed: a trade that cannot pay its own fees and spread is refused by every book. Configs saved by earlier versions pick the new behaviour up for C only (`require_evidence`).
+
 ## 0.6.0 — Trading logic and reliability
 
 - Journal uncertain orders, recover terminal fills exactly once, and commit fill/position/checkpoint accounting atomically.

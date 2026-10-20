@@ -1,6 +1,6 @@
 [project]
 name = "cryptobot"
-version = "0.6.0"
+version = "0.6.1"
 description = "Budget-capped automated crypto trading desktop app with TEST and BUY modes"
 requires-python = ">=3.12"
 dependencies = [
